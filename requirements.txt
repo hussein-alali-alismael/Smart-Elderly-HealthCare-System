@@ -1,0 +1,15 @@
+# Windows Flask/API runtime
+Flask>=3.0,<4.0
+PyMySQL>=1.1,<2.0
+python-dotenv>=1.0,<2.0
+
+# Optional Streamlit chatbot/runtime features
+streamlit>=1.40,<2.0
+langchain-core>=0.3,<2.0
+langchain-google-genai>=2.0,<3.0
+
+# Raspberry Pi HTTP client dependency
+requests>=2.31,<3.0
+
+# Optional: install on the Raspberry Pi only when using a real AS608 sensor.
+# pyfingerprint

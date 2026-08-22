@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Smart Elderly Health Care System</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 2rem; background: #f7f9fc; color: #233; }
+    .card { background: white; border: 1px solid #ddd; padding: 1.2rem; border-radius: 10px; margin-bottom: 1rem; box-shadow: 0 2px 6px rgba(0,0,0,0.05); }
+    table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; }
+    th, td { border-bottom: 1px solid #eaeaea; padding: 0.6rem; text-align: left; vertical-align: top; }
+    th { background: #f1f5f9; }
+    form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.6rem; max-width: 760px; }
+    input, button, select, textarea { padding: 0.6rem; border-radius: 6px; border: 1px solid #ccc; font: inherit; }
+    textarea { min-height: 90px; resize: vertical; }
+    button { background: #2563eb; color: white; cursor: pointer; grid-column: 1 / -1; }
+    .form-full { grid-column: 1 / -1; }
+    .muted { color: #666; }
+    .message { margin-top: 0.5rem; font-size: 0.95rem; }
+    .message.success { color: #166534; }
+    .message.error { color: #b91c1c; }
+    .badge-row { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+    .badge { display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.35rem 0.75rem; border-radius: 999px; font-size: 0.92rem; font-weight: 700; border: 1px solid transparent; }
+    .badge::before { content: ''; width: 0.55rem; height: 0.55rem; border-radius: 999px; background: currentColor; opacity: 0.9; }
+    .badge.running { background: #dcfce7; color: #166534; border-color: #86efac; }
+    .badge.stopped { background: #f3f4f6; color: #4b5563; border-color: #d1d5db; }
+    .badge.error { background: #fee2e2; color: #b91c1c; border-color: #fca5a5; }
+    .split { display: grid; grid-template-columns: 1fr; gap: 1rem; }
+    @media (min-width: 1200px) {
+      .split { grid-template-columns: 1.2fr 0.8fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Smart Elderly Health Care System</h1>
+    <div class="badge-row">
+      <span id="worker-badge" class="badge stopped">Worker status: checking…</span>
+      <span id="worker-details" class="muted">Background reminder worker status will appear here.</span>
+    </div>
+    <p class="muted">Medication management only: view records, add new ones, and edit existing ones.</p>
+  </div>
+
+  <div class="split">
+    <div class="card">
+      <h2>View Medications</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Name</th>
+            <th>Dosage</th>
+            <th>Form</th>
+            <th>Manufacturer</th>
+            <th>Side Effects</th>
+            <th>Instructions</th>
+            <th>Contraindications</th>
+          </tr>
+        </thead>
+        <tbody id="medications-body">
+          <tr><td colspan="8" class="muted">Loading...</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Add Medication</h2>
+      <form id="medication-add-form">
+        <input id="add-name" name="name" placeholder="Medication name" required>
+        <input id="add-dosage" name="dosage" placeholder="Dosage">
+        <input id="add-form" name="form" placeholder="Form">
+        <input id="add-manufacturer" name="manufacturer" placeholder="Manufacturer">
+        <textarea id="add-side-effects" name="side_effects" placeholder="Side effects"></textarea>
+        <textarea id="add-instructions" name="instructions" placeholder="Instructions"></textarea>
+        <textarea id="add-contraindications" name="contraindications" placeholder="Contraindications"></textarea>
+        <button type="submit" class="form-full">Add Medication</button>
+      </form>
+      <div id="add-message" class="message muted"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Edit Medication</h2>
+    <form id="medication-edit-form">
+      <input id="edit-id" name="id" type="number" placeholder="Medication ID" required>
+      <input id="edit-name" name="name" placeholder="Medication name" required>
+      <input id="edit-dosage" name="dosage" placeholder="Dosage">
+      <input id="edit-form" name="form" placeholder="Form">
+      <input id="edit-manufacturer" name="manufacturer" placeholder="Manufacturer">
+      <textarea id="edit-side-effects" name="side_effects" placeholder="Side effects"></textarea>
+      <textarea id="edit-instructions" name="instructions" placeholder="Instructions"></textarea>
+      <textarea id="edit-contraindications" name="contraindications" placeholder="Contraindications"></textarea>
+      <button type="submit" class="form-full">Save Medication</button>
+    </form>
+    <div id="edit-message" class="message muted"></div>
+  </div>
+
+  <div class="card">
+    <h2>Recent Notifications</h2>
+    <p class="muted">These messages come from the <code>notifications</code> table and update the dashboard frontend.</p>
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Resident</th>
+          <th>Type</th>
+          <th>Message</th>
+          <th>Sent At</th>
+        </tr>
+      </thead>
+      <tbody id="notifications-body">
+        <tr><td colspan="5" class="muted">Loading...</td></tr>
+      </tbody>
+    </table>
+    <div id="notifications-message" class="message muted">Live feed from the AI-generated reminders.</div>
+  </div>
+
+  <script>
+    function formatCell(value) {
+      return value === null || value === undefined || value === '' ? '—' : value;
+    }
+
+    function setWorkerBadge(state) {
+      const badge = document.getElementById('worker-badge');
+      const details = document.getElementById('worker-details');
+
+      if (!badge || !details) {
+        return;
+      }
+
+      badge.className = 'badge';
+
+      if (!state) {
+        badge.classList.add('stopped');
+        badge.textContent = 'Worker status: unavailable';
+        details.textContent = 'Could not load worker status from the server.';
+        return;
+      }
+
+      if (state.last_error) {
+        badge.classList.add('error');
+        badge.textContent = 'Worker status: error';
+        details.textContent = `Last error: ${state.last_error}`;
+        return;
+      }
+
+      if (state.running) {
+        badge.classList.add('running');
+        badge.textContent = 'Worker status: running';
+        details.textContent = `Last run: ${state.last_run_at || '—'} • Last payloads: ${state.last_payload_count ?? 0}`;
+        return;
+      }
+
+      badge.classList.add('stopped');
+      badge.textContent = 'Worker status: stopped';
+      details.textContent = 'The reminder worker is not currently active.';
+    }
+
+    function setEditForm(medication) {
+      document.getElementById('edit-id').value = medication.id || '';
+      document.getElementById('edit-name').value = medication.name || '';
+      document.getElementById('edit-dosage').value = medication.dosage || '';
+      document.getElementById('edit-form').value = medication.form || '';
+      document.getElementById('edit-manufacturer').value = medication.manufacturer || '';
+      document.getElementById('edit-side-effects').value = medication.sideEffects || '';
+      document.getElementById('edit-instructions').value = medication.instructions || '';
+      document.getElementById('edit-contraindications').value = medication.contraindications || '';
+    }
+
+    async function loadMedications() {
+      const body = document.getElementById('medications-body');
+      try {
+        const response = await fetch('/api/medications');
+        const data = await response.json();
+        const medications = data.medications || [];
+        body.innerHTML = '';
+
+        if (!medications.length) {
+          body.innerHTML = '<tr><td colspan="8" class="muted">No medications found.</td></tr>';
+          return;
+        }
+
+        medications.forEach((medication) => {
+          const row = document.createElement('tr');
+          row.innerHTML = `
+            <td>${formatCell(medication.id)}</td>
+            <td>${formatCell(medication.name)}</td>
+            <td>${formatCell(medication.dosage)}</td>
+            <td>${formatCell(medication.form)}</td>
+            <td>${formatCell(medication.manufacturer)}</td>
+            <td>${formatCell(medication.sideEffects)}</td>
+            <td>${formatCell(medication.instructions)}</td>
+            <td>${formatCell(medication.contraindications)}</td>
+          `;
+          row.addEventListener('click', () => setEditForm(medication));
+          row.style.cursor = 'pointer';
+          body.appendChild(row);
+        });
+      } catch (error) {
+        body.innerHTML = '<tr><td colspan="8" class="muted">Failed to load medications.</td></tr>';
+      }
+    }
+
+    async function loadNotifications() {
+      const body = document.getElementById('notifications-body');
+      const messageBox = document.getElementById('notifications-message');
+      try {
+        const response = await fetch('/api/notifications');
+        const data = await response.json();
+        const notifications = data.notifications || data.alerts || [];
+        body.innerHTML = '';
+
+        if (!notifications.length) {
+          body.innerHTML = '<tr><td colspan="5" class="muted">No notifications found.</td></tr>';
+          messageBox.textContent = 'No reminders have been saved yet.';
+          messageBox.className = 'message muted';
+          return;
+        }
+
+        notifications.forEach((notification) => {
+          const row = document.createElement('tr');
+          row.innerHTML = `
+            <td>${formatCell(notification.id)}</td>
+            <td>${formatCell(notification.resident_name || notification.patient_name || notification.residentId || notification.patient_id)}</td>
+            <td>${formatCell(notification.type)}</td>
+            <td>${formatCell(notification.message)}</td>
+            <td>${formatCell(notification.sentAt || notification.sent_at)}</td>
+          `;
+          body.appendChild(row);
+        });
+
+        messageBox.textContent = `Showing ${notifications.length} notification(s) from the database.`;
+        messageBox.className = 'message success';
+      } catch (error) {
+        body.innerHTML = '<tr><td colspan="5" class="muted">Failed to load notifications.</td></tr>';
+        messageBox.textContent = 'Could not load reminders from the backend.';
+        messageBox.className = 'message error';
+      }
+    }
+
+    async function loadWorkerStatus() {
+      try {
+        const response = await fetch('/api/notification-worker/status');
+        const data = await response.json();
+        setWorkerBadge(data.notification_worker);
+      } catch (error) {
+        setWorkerBadge(null);
+      }
+    }
+
+    document.getElementById('medication-add-form').addEventListener('submit', async function (event) {
+      event.preventDefault();
+      const messageBox = document.getElementById('add-message');
+      const payload = {
+        name: document.getElementById('add-name').value,
+        dosage: document.getElementById('add-dosage').value,
+        form: document.getElementById('add-form').value,
+        manufacturer: document.getElementById('add-manufacturer').value,
+        side_effects: document.getElementById('add-side-effects').value,
+        instructions: document.getElementById('add-instructions').value,
+        contraindications: document.getElementById('add-contraindications').value,
+      };
+
+      const response = await fetch('/api/medications', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const result = await response.json();
+      messageBox.textContent = response.ok ? 'Medication added successfully.' : (result.error || 'Failed to add medication.');
+      if (response.ok) {
+        this.reset();
+        loadMedications();
+      }
+    });
+
+    document.getElementById('medication-edit-form').addEventListener('submit', async function (event) {
+      event.preventDefault();
+      const medicationId = Number(document.getElementById('edit-id').value);
+      const messageBox = document.getElementById('edit-message');
+      const payload = {
+        name: document.getElementById('edit-name').value,
+        dosage: document.getElementById('edit-dosage').value,
+        form: document.getElementById('edit-form').value,
+        manufacturer: document.getElementById('edit-manufacturer').value,
+        side_effects: document.getElementById('edit-side-effects').value,
+        instructions: document.getElementById('edit-instructions').value,
+        contraindications: document.getElementById('edit-contraindications').value,
+      };
+
+      const response = await fetch(`/api/medications/${medicationId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const result = await response.json();
+      messageBox.textContent = response.ok ? 'Medication updated successfully.' : (result.error || 'Failed to update medication.');
+      if (response.ok) {
+        loadMedications();
+      }
+    });
+
+    loadMedications();
+    loadNotifications();
+    loadWorkerStatus();
+    setInterval(loadNotifications, 15000);
+    setInterval(loadWorkerStatus, 15000);
+  </script>
+</body>
+</html>

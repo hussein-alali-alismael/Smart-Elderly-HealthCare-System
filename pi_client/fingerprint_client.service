@@ -1,0 +1,15 @@
+[Unit]
+Description=Fingerprint client test sender
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/SEHCS_WEB/pi_client
+# Use the Python interpreter from the Desktop venv created as ~/Desktop/SEHCS
+ExecStart=/home/pi/Desktop/SEHCS/bin/python /home/pi/SEHCS_WEB/pi_client/fingerprint_client.py --server http://<FLASK_SERVER_IP>:5000 --id 7 --retries 10
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
