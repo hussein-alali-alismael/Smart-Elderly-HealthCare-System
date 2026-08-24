@@ -42,6 +42,33 @@ Install the optional dependency for the sensor:
 pip install pyfingerprint
 ```
 
+Voice prompts and results are enabled by default on the Pi. Install a speech
+engine and speaker support:
+
+```bash
+sudo apt install -y espeak-ng alsa-utils
+```
+
+Run with voice:
+
+```bash
+python fingerprint_sensor_bridge.py --server http://<FLASK_SERVER_IP>:5000 --device /dev/serial0
+```
+
+Disable speech when needed with `--no-voice`. The bridge speaks short messages
+only; the complete server response is still displayed and saved in the JSON
+history file. The Pi is the recommended voice device, so Flask server speech is
+disabled by default to prevent duplicate announcements.
+
+To enable schedule-reminder speech on the computer running Flask, set
+`SEHCS_SERVER_VOICE_ENABLED=true` in its environment. On Windows, speech uses
+PowerShell's built-in speech engine; on Linux it uses `espeak-ng` or `espeak`.
+Fingerprint check-in messages remain spoken by the Pi, avoiding duplicate audio.
+
+Set `SEHCS_TTS_VOICE=ar` for Arabic on a Pi if the Arabic voice is installed;
+use `en` for English. Available voices depend on the operating system and
+installed speech packages.
+
 The bridge uses the AS608's internal fingerprint search for normal check-in. The sensor position is sent to Flask as `fingerprint_id`; Flask treats that position as the resident id for this test setup. Raw templates are sent only during enrollment.
 
 Enroll one fingerprint for resident 7:
@@ -55,6 +82,19 @@ Then scan the same finger normally:
 ```bash
 python fingerprint_sensor_bridge.py --server http://<FLASK_SERVER_IP>:5000 --device /dev/serial0 --once
 ```
+
+For continuous scanning, omit `--once`. The program keeps running, displays a
+readable result after every scan, and saves the complete responses to
+`fingerprint_results.json`. Type `q` and press Enter to stop, or press
+`Ctrl+C`:
+
+```bash
+python fingerprint_sensor_bridge.py --server http://<FLASK_SERVER_IP>:5000 --device /dev/serial0 --json-file fingerprint_results.json
+```
+
+Use `--test-resident 7` only when the AS608 slot is also position 7. A
+recognized fingerprint in another sensor position is rejected rather than
+being incorrectly assigned to resident 7.
 
 The Flask agent will identify resident 7, load today's medication schedule, select the nearest scheduled time, and record the intake when it is within the configured time window.
 

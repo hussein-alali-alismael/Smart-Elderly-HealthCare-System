@@ -84,12 +84,12 @@ class FingerprintMedicationAgent:
         }
 
     @staticmethod
-    def _schedule_to_dict(schedule: MedicationScheduleRow) -> Dict[s ,tr, Any]:
+    def _schedule_to_dict(schedule: MedicationScheduleRow) -> Dict[str, Any]:
         """Return a JSON-safe schedule result."""
         result = asdict(schedule)
         for key in ("start_date", "end_date"):
             value = result.get(key)
-            if hasattr(value, "isoformat"):
+            if isinstance(value, (date, datetime)):
                 result[key] = value.isoformat()
         return result
 
@@ -397,7 +397,7 @@ class FingerprintMedicationAgent:
                 "success": False,
                 "step": "nearest_schedule_selection",
                 "message": "No medication time is close enough to the current real time.",
-                "resident": asdict(resident),
+                "resident": self._resident_to_dict(resident),
                 "result": None,
             }
 

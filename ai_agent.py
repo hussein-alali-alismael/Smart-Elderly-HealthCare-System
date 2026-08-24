@@ -30,6 +30,7 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 from repo import get_db_connection
+from voice import server_voice_enabled, speak
 
 load_dotenv()
 
@@ -118,7 +119,9 @@ class MedicationAssistant:
             {"input": message},
             config={"configurable": {"session_id": session_id}},
         )
-        return getattr(response, "content", str(response))
+        answer = getattr(response, "content", str(response))
+        speak(answer, enabled=server_voice_enabled())
+        return answer
 
 
 class MedicationSchedulerAgent:
@@ -217,18 +220,14 @@ class MedicationSchedulerAgent:
 
         now = now or datetime.now()
         notification_type = "medication_reminder"
+        spoken_time = planned_datetime.strftime("%I:%M %p").lstrip("0")
         message = (
-            f"Medication reminder for {schedule.resident_name}: "
-            f"take {schedule.medication_name} at {planned_datetime.isoformat(sep=' ', timespec='minutes')}."
+            f"Reminder for {schedule.resident_name}: it is time to take "
+            f"{schedule.medication_name} at {spoken_time}."
         )
 
         if self._notification_exists(connection, schedule.resident_id, notification_type, message):
-            return NotificationRecord(
-                residentId=schedule.resident_id,
-                type=notification_type,
-                message=message,
-                sentAt=now.isoformat(timespec="seconds"),
-            )
+            return None
 
         record = NotificationRecord(
             residentId=schedule.resident_id,
@@ -263,6 +262,7 @@ class MedicationSchedulerAgent:
             "announcement_window_minutes": self.announcement_window_minutes,
             "schedule": asdict(schedule),
             "planned_intake_datetime": planned_datetime.isoformat(timespec="seconds"),
+            "spoken_message": notification.message,
             "notification": asdict(notification),
         }
         return payload
@@ -281,7 +281,9 @@ class MedicationSchedulerAgent:
             if notification is None:
                 continue
 
-            payloads.append(self.node_4_make_text_json_for_webdash(schedule, planned_datetime, notification, now=now))
+            payload = self.node_4_make_text_json_for_webdash(schedule, planned_datetime, notification, now=now)
+            payloads.append(payload)
+            speak(notification.message, enabled=server_voice_enabled())
 
         return payloads
 
