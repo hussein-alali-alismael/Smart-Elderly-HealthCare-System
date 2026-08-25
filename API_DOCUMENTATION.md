@@ -36,7 +36,7 @@ For requests with a JSON body, send:
 
 `Content-Type: application/json`
 
-There is currently no login/authentication API. All routes are presently unprotected and should be treated as admin/caregiver routes.
+The backend uses a session cookie for authentication. The login identity must be an `openId` already verified by the application's OAuth provider. A user may own multiple residents; successful login returns both `residents` and their `residentIds`.
 
 ## 3. Common response and error rules
 
@@ -67,6 +67,22 @@ Typical status codes:
 Dates use `YYYY-MM-DD`. Datetimes generally use `YYYY-MM-DD HH:MM:SS` or ISO datetime strings. Boolean database flags are returned as `0` or `1`; the React frontend can convert them with `Boolean(value)`.
 
 ## 4. Endpoint reference
+
+### Authentication
+
+#### `POST /api/auth/login`
+
+Request: `{ "openId": "verified-oauth-open-id" }`
+
+Returns the authenticated user, all residents linked through `elderly_residents.user_id`, and a convenient `residentIds` array. The response sets an HTTP-only session cookie.
+
+#### `GET /api/auth/me`
+
+Returns the current user and their current resident list. Requires login.
+
+#### `POST /api/auth/logout`
+
+Clears the current session.
 
 ### Health and dashboard
 

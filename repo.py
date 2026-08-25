@@ -1,10 +1,12 @@
 import os
-from datetime import date, datetime
+import threading
+from datetime import date, datetime, timedelta
 
 import pymysql
 from flask import jsonify
 
 db_connection = None
+_db_connections = threading.local()
 app = None
 
 def connect_to_database():
@@ -26,16 +28,21 @@ def connect_to_database():
 def get_db_connection():
     global db_connection
 
-    if db_connection is not None:
+    connection = getattr(_db_connections, "connection", None)
+    if connection is not None:
         try:
-            db_connection.ping()
-            return db_connection
+            connection.ping(reconnect=True)
+            return connection
         except Exception:
-            db_connection = None
+            _db_connections.connection = None
 
     try:
-        db_connection = connect_to_database()
-        return db_connection
+        connection = connect_to_database()
+        _db_connections.connection = connection
+        # Keep this name for compatibility with older imports; request/worker
+        # code uses the thread-local connection above.
+        db_connection = connection
+        return connection
     except Exception as exc:
         if app is not None:
             app.logger.error("Database connection failed: %s", exc)
@@ -49,6 +56,87 @@ def get_default_user_id(connection):
     return row["id"] if row else None
 
 
+def ensure_medication_ownership():
+    """Add ownership to older installations that used a global medication catalog."""
+    connection = get_db_connection()
+    if connection is None:
+        return
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """SELECT COUNT(*) AS count FROM information_schema.COLUMNS
+               WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'medications'
+               AND COLUMN_NAME = 'user_id'"""
+        )
+        if cursor.fetchone()["count"] == 0:
+            cursor.execute("ALTER TABLE medications ADD COLUMN user_id INT NULL AFTER id")
+            default_user_id = get_default_user_id(connection)
+            if default_user_id is not None:
+                cursor.execute("UPDATE medications SET user_id = %s WHERE user_id IS NULL", (default_user_id,))
+            cursor.execute("CREATE INDEX idx_medications_user_id ON medications (user_id)")
+    connection.commit()
+
+
+def get_user_by_open_id(open_id):
+    """Return the account and all resident IDs associated with an OAuth identity."""
+    if not open_id or not isinstance(open_id, str):
+        return None
+
+    connection = get_db_connection()
+    if connection is None:
+        return None
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT id, openId, name, email, role
+            FROM users
+            WHERE openId = %s OR email = %s
+            LIMIT 1
+            """,
+            (open_id.strip(), open_id.strip()),
+        )
+        user = cursor.fetchone()
+        if user is None:
+            return None
+
+        cursor.execute(
+            """
+            SELECT id, name, dateOfBirth, notes
+            FROM elderly_residents
+            WHERE user_id = %s
+            ORDER BY id ASC
+            """,
+            (user["id"],),
+        )
+        user["residents"] = cursor.fetchall()
+
+    return user
+
+
+def create_user(name, email):
+    """Create a local account using the schema's existing email/openId identity."""
+    name = (name or "").strip()
+    email = (email or "").strip().lower()
+    if not name or not email or "@" not in email:
+        return jsonify({"error": "Name and a valid email are required."}), 400
+
+    connection = get_db_connection()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT id FROM users WHERE openId = %s OR email = %s LIMIT 1", (email, email))
+        if cursor.fetchone() is not None:
+            return jsonify({"error": "An account with this email already exists."}), 409
+        cursor.execute(
+            "INSERT INTO users (openId, name, email, role) VALUES (%s, %s, %s, 'user')",
+            (email, name, email),
+        )
+        user_id = cursor.lastrowid
+    connection.commit()
+    return jsonify({"id": user_id, "openId": email, "name": name, "email": email, "role": "user"}), 201
+
+
 def calculate_date_of_birth(age):
     if not isinstance(age, int):
         return None
@@ -57,23 +145,34 @@ def calculate_date_of_birth(age):
     except ValueError:
         return None
 
-def list_residents():
+def list_residents(user_id=None):
         connection = get_db_connection()
         if connection is None:
             return jsonify({"error": "Database is not available."}), 503
 
         with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT id, user_id, name, dateOfBirth, notes, createdAt
-                FROM elderly_residents
-                ORDER BY id ASC
-                """
-            )
+            if user_id is None:
+                cursor.execute(
+                    """
+                    SELECT id, user_id, name, dateOfBirth, notes, createdAt
+                    FROM elderly_residents
+                    ORDER BY id ASC
+                    """
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT id, user_id, name, dateOfBirth, notes, createdAt
+                    FROM elderly_residents
+                    WHERE user_id = %s
+                    ORDER BY id ASC
+                    """,
+                    (user_id,),
+                )
             residents = cursor.fetchall()
         return jsonify({"residents": residents})
     
-def create_patient(payload):
+def create_patient(payload, user_id=None):
         name = payload.get("name", "").strip()
         age = payload.get("age")
         date_of_birth = payload.get("dateOfBirth")
@@ -92,7 +191,7 @@ def create_patient(payload):
         if connection is None:
             return jsonify({"error": "Database is not available."}), 503
 
-        user_id = get_default_user_id(connection)
+        user_id = user_id or get_default_user_id(connection)
         if user_id is None:
             return jsonify({"error": "No user found in the database."}), 500
  
@@ -118,7 +217,7 @@ def create_patient(payload):
             "status": "stable",
         }), 201
 
-def alerts():
+def alerts(user_id=None):
         connection = get_db_connection()
         if connection is None:
             return jsonify({"error": "Database is not available."}), 503
@@ -129,9 +228,10 @@ def alerts():
                 SELECT n.id, n.residentId, n.type, n.message, n.isSent, n.sentAt,
                        r.name AS resident_name
                 FROM notifications n
-                LEFT JOIN elderly_residents r ON r.id = n.residentId
+                INNER JOIN elderly_residents r ON r.id = n.residentId AND r.user_id = %s
                 ORDER BY n.id DESC
                 """
+                , (user_id,)
             )
             rows = cursor.fetchall()
 
@@ -149,7 +249,7 @@ def alerts():
         return jsonify({"alerts": alerts})
 
 
-def list_notifications():
+def list_notifications(user_id=None):
         connection = get_db_connection()
         if connection is None:
             return jsonify({"error": "Database is not available."}), 503
@@ -160,9 +260,10 @@ def list_notifications():
                 SELECT n.id, n.residentId, n.type, n.message, n.isSent, n.sentAt,
                        n.isRead, n.readAt, r.name AS resident_name
                 FROM notifications n
-                LEFT JOIN elderly_residents r ON r.id = n.residentId
+                INNER JOIN elderly_residents r ON r.id = n.residentId AND r.user_id = %s
                 ORDER BY n.id DESC
                 """
+                , (user_id,)
             )
             rows = cursor.fetchall()
 
@@ -183,7 +284,7 @@ def list_notifications():
         return jsonify({"notifications": notifications})
 
 
-def create_notification(payload):
+def create_notification(payload, user_id=None):
         resident_id = payload.get("residentId") or payload.get("resident_id")
         notification_type = (payload.get("type") or "").strip()
         message = (payload.get("message") or "").strip()
@@ -200,6 +301,9 @@ def create_notification(payload):
             return jsonify({"error": "Database is not available."}), 503
 
         with connection.cursor() as cursor:
+            cursor.execute("SELECT id FROM elderly_residents WHERE id = %s AND user_id = %s", (resident_id, user_id))
+            if cursor.fetchone() is None:
+                return jsonify({"error": "Resident not found."}), 404
             cursor.execute(
                 """
                 SELECT id
@@ -248,7 +352,7 @@ def create_notification(payload):
         }), 201
 
 
-def list_medications():
+def list_medications(user_id=None):
         connection = get_db_connection()
         if connection is not None:
             with connection.cursor() as cursor:
@@ -256,8 +360,9 @@ def list_medications():
                     """
                     SELECT id, name, dosage, form, manufacturer, sideEffects, instructions, contraindications
                     FROM medications
+                    WHERE user_id = %s
                     ORDER BY id ASC
-                    """
+                    """, (user_id,)
                 )
                 medications = cursor.fetchall()
             return jsonify({"medications": medications})
@@ -265,7 +370,7 @@ def list_medications():
         return jsonify({"medications": []})
 
 
-def create_medication(payload):
+def create_medication(payload, user_id=None):
         name = payload.get("name", "").strip()
         dosage = payload.get("dosage", "").strip()
         form = payload.get("form", "").strip()
@@ -284,10 +389,11 @@ def create_medication(payload):
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                INSERT INTO medications (name, dosage, form, manufacturer, sideEffects, instructions, contraindications)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO medications (user_id, name, dosage, form, manufacturer, sideEffects, instructions, contraindications)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
+                    user_id,
                     name,
                     dosage or None,
                     form or None,
@@ -313,7 +419,7 @@ def create_medication(payload):
         }), 201
 
 
-def update_medication(medication_id, payload):
+def update_medication(medication_id, payload, user_id=None):
         name = payload.get("name", "").strip()
         dosage = payload.get("dosage", "").strip()
         form = payload.get("form", "").strip()
@@ -330,7 +436,7 @@ def update_medication(medication_id, payload):
             return jsonify({"error": "Database is not available."}), 503
 
         with connection.cursor() as cursor:
-            cursor.execute("SELECT id FROM medications WHERE id = %s", (medication_id,))
+            cursor.execute("SELECT id FROM medications WHERE id = %s AND user_id = %s", (medication_id, user_id))
             if cursor.fetchone() is None:
                 return jsonify({"error": "Medication not found."}), 404
 
@@ -372,7 +478,7 @@ def update_medication(medication_id, payload):
         }), 200
 
 
-def list_medication_schedules():
+def list_medication_schedules(user_id=None):
         connection = get_db_connection()
         if connection is None:
             return jsonify({"error": "Database is not available."}), 503
@@ -384,16 +490,16 @@ def list_medication_schedules():
                        m.name AS medication_name, ms.frequency, ms.startDate, ms.endDate,
                        ms.isActive, ms.notes, ms.createdAt
                 FROM medication_schedules ms
-                LEFT JOIN elderly_residents r ON r.id = ms.residentId
+                INNER JOIN elderly_residents r ON r.id = ms.residentId AND r.user_id = %s
                 LEFT JOIN medications m ON m.id = ms.medicationId
                 ORDER BY ms.id ASC
-                """
+                """, (user_id,)
             )
             schedules = cursor.fetchall()
         return jsonify({"schedules": schedules})
 
 
-def list_medication_schedule_times():
+def list_medication_schedule_times(user_id=None):
         connection = get_db_connection()
         if connection is None:
             return jsonify({"error": "Database is not available."}), 503
@@ -401,16 +507,25 @@ def list_medication_schedule_times():
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id, scheduleId, timeOfDay, createdAt
-                FROM medication_schedule_times
-                ORDER BY id ASC
-                """
+                SELECT mst.id, mst.scheduleId, mst.timeOfDay, mst.createdAt
+                FROM medication_schedule_times mst
+                INNER JOIN medication_schedules ms ON ms.id = mst.scheduleId
+                INNER JOIN elderly_residents r ON r.id = ms.residentId AND r.user_id = %s
+                ORDER BY mst.id ASC
+                """, (user_id,)
             )
             schedule_times = cursor.fetchall()
+        for schedule_time in schedule_times:
+            value = schedule_time.get("timeOfDay")
+            if isinstance(value, timedelta):
+                total_seconds = int(value.total_seconds())
+                hours, remainder = divmod(total_seconds, 3600)
+                minutes, seconds = divmod(remainder, 60)
+                schedule_time["timeOfDay"] = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
         return jsonify({"schedule_times": schedule_times})
 
 
-def list_medication_intakes():
+def list_medication_intakes(user_id=None):
         connection = get_db_connection()
         if connection is None:
             return jsonify({"error": "Database is not available."}), 503
@@ -418,11 +533,14 @@ def list_medication_intakes():
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id, medicationScheduleTimeId, plannedIntakeDateTime, actualIntakeDateTime,
-                       status, actualDosage, notes, createdAt
-                FROM medication_intakes
-                ORDER BY id ASC
-                """
+                  SELECT mi.id, mi.medicationScheduleTimeId, mi.plannedIntakeDateTime, mi.actualIntakeDateTime,
+                      mi.status, mi.actualDosage, mi.notes, mi.createdAt
+                FROM medication_intakes mi
+                INNER JOIN medication_schedule_times mst ON mst.id = mi.medicationScheduleTimeId
+                INNER JOIN medication_schedules ms ON ms.id = mst.scheduleId
+                INNER JOIN elderly_residents r ON r.id = ms.residentId AND r.user_id = %s
+                ORDER BY mi.id ASC
+                """, (user_id,)
             )
             intakes = cursor.fetchall()
         return jsonify({"intakes": intakes})

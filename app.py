@@ -4,14 +4,18 @@ import atexit
 import logging
 from datetime import datetime
 
-from flask import Flask, current_app, jsonify, render_template, request
+from dotenv import load_dotenv
+from flask import Flask, current_app, jsonify, redirect, render_template, request, session
 
 from repo import (
     alerts as repo_alerts,
     create_notification as repo_create_notification,
     create_medication as repo_create_medication,
     create_patient as repo_create_patient,
+    create_user as repo_create_user,
     get_db_connection,
+    get_user_by_open_id,
+    ensure_medication_ownership,
     list_medication_intakes as repo_list_medication_intakes,
     list_medication_schedules as repo_list_medication_schedules,
     list_medication_schedule_times as repo_list_medication_schedule_times,
@@ -24,6 +28,8 @@ from repo import (
 )
 from ai_agent import MONITOR_INTERVAL_SECONDS, MedicationSchedulerAgent
 from fingerprint_agent import FingerprintMedicationAgent
+
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 # Default network binding so `flask run` and direct execution are LAN-reachable by default.
 os.environ.setdefault("FLASK_RUN_HOST", "0.0.0.0")
@@ -87,77 +93,192 @@ def _stop_notification_worker():
 def get_notification_worker_status():
     return jsonify({"notification_worker": _notification_worker_state})
 
+
+def _login_required(view):
+    """Require a logged-in session for browser/API data routes."""
+    from functools import wraps
+
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if "user_id" not in session:
+            return jsonify({"error": "Authentication required."}), 401
+        return view(*args, **kwargs)
+
+    return wrapped
+
 def create_app():
     global app
     app = Flask(__name__)
     app.config["JSON_SORT_KEYS"] = False
+    app.secret_key = os.getenv("FLASK_SECRET_KEY", "development-only-change-me")
+    app.config["SESSION_COOKIE_HTTPONLY"] = True
+    app.config["SESSION_COOKIE_SAMESITE"] = os.getenv("SESSION_COOKIE_SAMESITE", "Lax")
+    app.config["SESSION_COOKIE_SECURE"] = os.getenv("SESSION_COOKIE_SECURE", "0").lower() in {"1", "true", "yes"}
     get_db_connection()
+    ensure_medication_ownership()
 
     @app.route("/")
     def index():
+        if "user_id" not in session:
+            return redirect("/login")
         return render_template("index.html")
+
+    @app.route("/login")
+    def login_page():
+        if "user_id" in session:
+            return redirect("/")
+        return render_template("login.html")
+
+    @app.route("/signup")
+    def signup_page():
+        if "user_id" in session:
+            return redirect("/")
+        return render_template("signup.html")
+
+    @app.route("/<page>.html")
+    def frontend_page(page):
+        """Render one of the dashboard pages from Flask's templates folder."""
+        allowed_pages = {"index", "live", "medications", "notifications", "patient_details"}
+        if page not in allowed_pages:
+            return jsonify({"error": "Page not found."}), 404
+        if "user_id" not in session:
+            return redirect("/login")
+        return render_template(f"{page}.html")
 
     @app.route("/health", methods=["GET"])
     def health():
         return jsonify({"status": "ok"})
 
+    @app.route("/api/auth/login", methods=["POST"])
+    def login():
+        payload = request.get_json(silent=True) or {}
+        open_id = payload.get("openId") or payload.get("open_id")
+        user = get_user_by_open_id(open_id)
+        if user is None:
+            return jsonify({"error": "Invalid user identity."}), 401
+
+        session.clear()
+        session["user_id"] = user["id"]
+        session["open_id"] = user["openId"]
+        session["role"] = user["role"]
+        return jsonify({
+            "user": {
+                "id": user["id"],
+                "openId": user["openId"],
+                "name": user["name"],
+                "email": user["email"],
+                "role": user["role"],
+            },
+            "residents": user["residents"],
+            "residentIds": [resident["id"] for resident in user["residents"]],
+        })
+
+    @app.route("/api/auth/signup", methods=["POST"])
+    def signup():
+        payload = request.get_json(silent=True) or {}
+        result = repo_create_user(payload.get("name"), payload.get("email"))
+        if isinstance(result, tuple):
+            response, status = result
+            if status != 201:
+                return response, status
+        user = get_user_by_open_id(payload.get("email"))
+        if user is None:
+            return jsonify({"error": "Account was created but could not be loaded."}), 500
+        session.clear()
+        session["user_id"] = user["id"]
+        session["open_id"] = user["openId"]
+        session["role"] = user["role"]
+        return jsonify({"user": {key: user[key] for key in ("id", "openId", "name", "email", "role")}}), 201
+
+    @app.route("/api/auth/me", methods=["GET"])
+    @_login_required
+    def current_user():
+        user = get_user_by_open_id(session.get("open_id"))
+        if user is None:
+            session.clear()
+            return jsonify({"error": "User account no longer exists."}), 401
+        return jsonify({
+            "user": {key: user[key] for key in ("id", "openId", "name", "email", "role")},
+            "residents": user["residents"],
+            "residentIds": [resident["id"] for resident in user["residents"]],
+        })
+
+    @app.route("/api/auth/logout", methods=["POST"])
+    def logout():
+        session.clear()
+        return jsonify({"status": "logged_out"})
+
     @app.route("/api/residents", methods=["GET"])
+    @_login_required
     def list_residents_endpoint():
-        return list_residents()
+        return list_residents(session["user_id"])
 
     @app.route("/api/patients", methods=["GET"])
+    @_login_required
     def list_patients():
-        return list_residents()
+        return list_residents(session["user_id"])
 
     @app.route("/api/patients", methods=["POST"])
+    @_login_required
     def patient_endpoint():
         payload = request.get_json(silent=True) or {}
-        return repo_create_patient(payload)
+        return repo_create_patient(payload, user_id=session["user_id"])
         
     @app.route("/api/alerts")
+    @_login_required
     def alerts_endpoint():
-        return repo_alerts()
+        return repo_alerts(session["user_id"])
 
     @app.route("/api/notifications", methods=["GET"])
+    @_login_required
     def list_notifications():
-        return repo_list_notifications()
+        return repo_list_notifications(session["user_id"])
 
     @app.route("/api/notifications", methods=["POST"])
+    @_login_required
     def create_notification():
         payload = request.get_json(silent=True) or {}
-        return repo_create_notification(payload)
+        return repo_create_notification(payload, session["user_id"])
 
     @app.route("/api/medications", methods=["GET"])
+    @_login_required
     def list_medications():
-        return repo_list_medications()
+        return repo_list_medications(session["user_id"])
 
     @app.route("/api/medication-schedules", methods=["GET"])
+    @_login_required
     def list_medication_schedules():
-        return repo_list_medication_schedules()
+        return repo_list_medication_schedules(session["user_id"])
 
     @app.route("/api/medication-schedule-times", methods=["GET"])
+    @_login_required
     def list_medication_schedule_times():
-        return repo_list_medication_schedule_times()
+        return repo_list_medication_schedule_times(session["user_id"])
 
     @app.route("/api/medication-intakes", methods=["GET"])
+    @_login_required
     def list_medication_intakes():
-        return repo_list_medication_intakes()
+        return repo_list_medication_intakes(session["user_id"])
 
     @app.route("/api/resident-medical-conditions", methods=["GET"])
+    @_login_required
     def list_resident_medical_conditions():
         return repo_list_resident_medical_conditions()
 
     @app.route("/api/medications", methods=["POST"])
+    @_login_required
     def create_medication():
         payload = request.get_json(silent=True) or {}
-        return repo_create_medication(payload)
+        return repo_create_medication(payload, session["user_id"])
 
     @app.route("/api/medications/<int:medication_id>", methods=["PUT", "PATCH"])
+    @_login_required
     def update_medication(medication_id):
         payload = request.get_json(silent=True) or {}
-        return repo_update_medication(medication_id, payload)
+        return repo_update_medication(medication_id, payload, session["user_id"])
 
     @app.route("/api/notification-worker/status", methods=["GET"])
+    @_login_required
     def notification_worker_status():
         return get_notification_worker_status()
 
@@ -182,6 +303,7 @@ def create_app():
         return jsonify(result)
 
     @app.route("/api/_debug/routes", methods=["GET"])
+    @_login_required
     def debug_list_routes():
         """Return a list of registered routes (for debugging)."""
         routes = []
@@ -194,6 +316,7 @@ def create_app():
         return jsonify({"routes": routes})
 
     @app.route("/api/residents/<int:resident_id>/fingerprint", methods=["POST"])
+    @_login_required
     def enroll_resident_fingerprint(resident_id):
         """Enroll a base64-encoded fingerprint template for a resident.
 
