@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 User=pi
 WorkingDirectory=/home/pi/SEHCS_WEB/pi_client
+EnvironmentFile=-/home/pi/SEHCS_WEB/pi_client/pi.env
 # Use the Python interpreter from the Desktop venv created as ~/Desktop/SEHCS
 # Edit the --server and --device arguments as needed for your environment.
 # Default device set to /dev/serial0 (friendly UART alias on Raspberry Pi)

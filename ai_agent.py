@@ -39,6 +39,18 @@ MONITOR_INTERVAL_SECONDS = int(os.getenv("MONITOR_INTERVAL_SECONDS", "300"))
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
 
+def _speak_async(text: str) -> None:
+    """Start speech without blocking the scheduler worker."""
+    def speak_safely() -> None:
+        try:
+            speak(text, enabled=server_voice_enabled())
+        except Exception:
+            # A TTS failure must never stop future medication reminders.
+            pass
+
+    threading.Thread(target=speak_safely, daemon=True).start()
+
+
 @dataclass
 class ScheduleRecord:
     schedule_id: int
@@ -82,9 +94,14 @@ class MedicationAssistant:
         self.api_key = api_key or os.getenv("GEMINI_API_KEY", "")
         self.model_name = model_name
         self._histories: Dict[str, InMemoryChatMessageHistory] = {}
-        self._chain = self._build_chain()
+        # Gemini is optional. Delay client construction until the feature is
+        # actually used, so the Flask/Streamlit app can start without a key.
+        self._chain = None
 
     def _build_chain(self):
+        if not self.api_key:
+            return None
+
         model = ChatGoogleGenerativeAI(
             model=self.model_name,
             temperature=0.6,
@@ -115,12 +132,19 @@ class MedicationAssistant:
         return self._histories[session_id]
 
     def ask(self, message: str, session_id: str = "default") -> str:
+        if not self.api_key:
+            return "The Gemini assistant is unavailable because GEMINI_API_KEY is not configured."
+
+        if self._chain is None:
+            self._chain = self._build_chain()
+        if self._chain is None:
+            return "The Gemini assistant is unavailable because GEMINI_API_KEY is not configured."
+
         response = self._chain.invoke(
             {"input": message},
             config={"configurable": {"session_id": session_id}},
         )
         answer = getattr(response, "content", str(response))
-        speak(answer, enabled=server_voice_enabled())
         return answer
 
 
@@ -137,6 +161,7 @@ class MedicationSchedulerAgent:
         if connection is None:
             return []
 
+        today = datetime.now().date().isoformat()
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -154,9 +179,12 @@ class MedicationSchedulerAgent:
                 LEFT JOIN elderly_residents r ON r.id = ms.residentId
                 LEFT JOIN medications m ON m.id = ms.medicationId
                 INNER JOIN medication_schedule_times mst ON mst.scheduleId = ms.id
-                WHERE ms.isActive = 1
+                                WHERE ms.isActive = 1
+                                    AND ms.startDate <= %s
+                                    AND (ms.endDate IS NULL OR ms.endDate >= %s)
                 ORDER BY ms.id ASC, mst.timeOfDay ASC
-                """
+                                """,
+                                (today, today),
             )
             rows = cursor.fetchall() or []
 
@@ -197,7 +225,69 @@ class MedicationSchedulerAgent:
             return planned_datetime
         return None
 
-    def _notification_exists(self, connection, resident_id: int, notification_type: str, message: str) -> bool:
+    def node_3_sync_daily_intake_statuses(
+        self,
+        schedules: List[ScheduleRecord],
+        now: Optional[datetime] = None,
+    ) -> None:
+        """Create today's pending intakes and mark expired pending intakes missed."""
+        connection = get_db_connection()
+        if connection is None:
+            return
+
+        now = now or datetime.now()
+        today = now.date().isoformat()
+        missed_before = now - timedelta(minutes=self.announcement_window_minutes)
+
+        with connection.cursor() as cursor:
+            for schedule in schedules:
+                planned_datetime = datetime.combine(
+                    now.date(),
+                    datetime.strptime(schedule.time_of_day, "%H:%M:%S").time(),
+                )
+                planned_text = planned_datetime.strftime("%Y-%m-%d %H:%M:%S")
+                cursor.execute(
+                    """
+                    SELECT id, status
+                    FROM medication_intakes
+                    WHERE medicationScheduleTimeId = %s
+                      AND DATE(plannedIntakeDateTime) = %s
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (schedule.schedule_time_id, today),
+                )
+                existing = cursor.fetchone()
+
+                if existing is None:
+                    initial_status = "missed" if planned_datetime <= missed_before else "pending"
+                    cursor.execute(
+                        """
+                        INSERT INTO medication_intakes
+                            (medicationScheduleTimeId, plannedIntakeDateTime, status)
+                        VALUES (%s, %s, %s)
+                        """,
+                        (schedule.schedule_time_id, planned_text, initial_status),
+                    )
+                elif existing.get("status") == "pending" and planned_datetime <= missed_before:
+                    cursor.execute(
+                        """
+                        UPDATE medication_intakes
+                        SET status = %s
+                        WHERE id = %s
+                        """,
+                        ("missed", existing["id"]),
+                    )
+
+    def _notification_exists(
+        self,
+        connection,
+        resident_id: int,
+        notification_type: str,
+        message: str,
+        notification_date: Optional[str] = None,
+    ) -> bool:
+        notification_date = notification_date or datetime.now().date().isoformat()
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -206,9 +296,10 @@ class MedicationSchedulerAgent:
                 WHERE residentId = %s
                   AND type = %s
                   AND message = %s
+                  AND DATE(sentAt) = %s
                 LIMIT 1
                 """,
-                (resident_id, notification_type, message),
+                (resident_id, notification_type, message, notification_date),
             )
             return cursor.fetchone() is not None
 
@@ -226,7 +317,13 @@ class MedicationSchedulerAgent:
             f"{schedule.medication_name} at {spoken_time}."
         )
 
-        if self._notification_exists(connection, schedule.resident_id, notification_type, message):
+        if self._notification_exists(
+            connection,
+            schedule.resident_id,
+            notification_type,
+            message,
+            notification_date=now.date().isoformat(),
+        ):
             return None
 
         record = NotificationRecord(
@@ -271,8 +368,10 @@ class MedicationSchedulerAgent:
         """Run the pipeline one time and return the dashboard payloads."""
         now = datetime.now()
         payloads: List[Dict[str, object]] = []
+        schedules = self.node_1_load_schedule_time()
+        self.node_3_sync_daily_intake_statuses(schedules, now=now)
 
-        for schedule in self.node_1_load_schedule_time():
+        for schedule in schedules:
             planned_datetime = self.node_2_check_if_suitable_to_announce(schedule, now=now)
             if planned_datetime is None:
                 continue
@@ -283,7 +382,7 @@ class MedicationSchedulerAgent:
 
             payload = self.node_4_make_text_json_for_webdash(schedule, planned_datetime, notification, now=now)
             payloads.append(payload)
-            speak(notification.message, enabled=server_voice_enabled())
+            _speak_async(notification.message)
 
         return payloads
 

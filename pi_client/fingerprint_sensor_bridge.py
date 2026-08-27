@@ -110,11 +110,13 @@ def _display_result(result: Dict[str, Any], json_file: str) -> None:
 
 
 def _post_with_retries(url: str, payload: Dict[str, Any], retries: int, timeout: int = 6) -> Dict[str, Any]:
+    device_token = os.getenv("FINGERPRINT_DEVICE_TOKEN", "")
+    headers = {"X-Fingerprint-Token": device_token} if device_token else {}
     attempt = 0
     while True:
         attempt += 1
         try:
-            resp = requests.post(url, json=payload, timeout=timeout)
+            resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
             try:
                 body = resp.json()
             except Exception:

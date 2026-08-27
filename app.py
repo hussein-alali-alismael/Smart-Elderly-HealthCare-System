@@ -2,7 +2,11 @@ import os
 import threading
 import atexit
 import logging
+import hmac
+import secrets
+from dataclasses import asdict
 from datetime import datetime
+from typing import cast
 
 from dotenv import load_dotenv
 from flask import Flask, current_app, jsonify, redirect, render_template, request, session
@@ -27,6 +31,7 @@ from repo import (
     set_resident_fingerprint,
 )
 from ai_agent import MONITOR_INTERVAL_SECONDS, MedicationSchedulerAgent
+from fall_alert_agent import FallDetectionPipeline
 from fingerprint_agent import FingerprintMedicationAgent
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -64,6 +69,8 @@ def _notification_worker_loop(app_instance):
 
         _notification_worker_stop.wait(MONITOR_INTERVAL_SECONDS)
 
+    _notification_worker_state["running"] = False
+
 
 def _start_notification_worker(app_instance):
     global _notification_worker_thread
@@ -91,7 +98,12 @@ def _stop_notification_worker():
 
 
 def get_notification_worker_status():
-    return jsonify({"notification_worker": _notification_worker_state})
+    thread = _notification_worker_thread
+    status = dict(_notification_worker_state)
+    status["running"] = bool(
+        status["running"] and thread is not None and thread.is_alive()
+    )
+    return jsonify({"notification_worker": status})
 
 
 def _login_required(view):
@@ -110,7 +122,10 @@ def create_app():
     global app
     app = Flask(__name__)
     app.config["JSON_SORT_KEYS"] = False
-    app.secret_key = os.getenv("FLASK_SECRET_KEY", "development-only-change-me")
+    configured_secret = os.getenv("FLASK_SECRET_KEY", "").strip()
+    if not configured_secret or configured_secret.startswith("replace-with-"):
+        configured_secret = secrets.token_hex(32)
+    app.secret_key = configured_secret
     app.config["SESSION_COOKIE_HTTPONLY"] = True
     app.config["SESSION_COOKIE_SAMESITE"] = os.getenv("SESSION_COOKIE_SAMESITE", "Lax")
     app.config["SESSION_COOKIE_SECURE"] = os.getenv("SESSION_COOKIE_SECURE", "0").lower() in {"1", "true", "yes"}
@@ -263,7 +278,7 @@ def create_app():
     @app.route("/api/resident-medical-conditions", methods=["GET"])
     @_login_required
     def list_resident_medical_conditions():
-        return repo_list_resident_medical_conditions()
+        return repo_list_resident_medical_conditions(session["user_id"])
 
     @app.route("/api/medications", methods=["POST"])
     @_login_required
@@ -289,6 +304,13 @@ def create_app():
         Expected JSON body: any of the formats supported by `FingerprintMedicationAgent.process_fingerprint`,
         for example: { "fingerprint_id": 7 } or { "fingerprintTemplate": "...base64..." }
         """
+        device_token = os.getenv("FINGERPRINT_DEVICE_TOKEN", "").strip()
+        supplied_token = request.headers.get("X-Fingerprint-Token", "")
+        if not device_token:
+            return jsonify({"error": "Fingerprint device authentication is not configured."}), 503
+        if not supplied_token or not hmac.compare_digest(supplied_token, device_token):
+            return jsonify({"error": "Fingerprint device authentication required."}), 401
+
         payload = request.get_json(silent=True)
         if payload is None:
             return jsonify({"error": "Invalid or missing JSON payload."}), 400
@@ -302,18 +324,54 @@ def create_app():
 
         return jsonify(result)
 
-    @app.route("/api/_debug/routes", methods=["GET"])
-    @_login_required
-    def debug_list_routes():
-        """Return a list of registered routes (for debugging)."""
-        routes = []
-        for rule in current_app.url_map.iter_rules():
-            routes.append({
-                "endpoint": rule.endpoint,
-                "methods": sorted(list(rule.methods or ())),
-                "rule": str(rule),
-            })
-        return jsonify({"routes": routes})
+    @app.route("/api/fall-alerts", methods=["POST"])
+    def fall_alert():
+        """Receive a fall event from a detector and persist it once.
+
+        This endpoint deliberately does not call ``process_fall_event``: that
+        method dispatches live webhooks and would post back to this endpoint.
+        The HTTP receiver only parses, validates, and stores the event.
+        """
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"error": "Invalid or missing JSON payload."}), 400
+
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        data = cast(dict[str, object], data)
+        pipeline = FallDetectionPipeline(backend_url="")
+        event = pipeline.node_1_receive_signal(data)
+        if event is None:
+            return jsonify({"status": "rejected", "reason": "invalid_payload"}), 400
+        if not pipeline.node_2_verify_criticality(event):
+            db_synced = pipeline.node_3_push_emergency_to_db(event, create_notification=False)
+            return jsonify({
+                "status": "logged",
+                "db_synced": db_synced,
+                "event_details": asdict(event),
+            }), 201
+        if not pipeline.node_3_push_emergency_to_db(event):
+            return jsonify({"status": "failed", "reason": "database_unavailable"}), 503
+        audio_alerted = pipeline.node_5_trigger_audio_alarm(event)
+
+        return jsonify({
+            "status": "received",
+            "audio_alerted": audio_alerted,
+            "event_details": asdict(event),
+        }), 201
+
+    if os.getenv("ENABLE_DEBUG_ROUTES", "").lower() in {"1", "true", "yes", "on"}:
+        @app.route("/api/_debug/routes", methods=["GET"])
+        @_login_required
+        def debug_list_routes():
+            """Return a list of registered routes (for debugging)."""
+            routes = []
+            for rule in current_app.url_map.iter_rules():
+                routes.append({
+                    "endpoint": rule.endpoint,
+                    "methods": sorted(list(rule.methods or ())),
+                    "rule": str(rule),
+                })
+            return jsonify({"routes": routes})
 
     @app.route("/api/residents/<int:resident_id>/fingerprint", methods=["POST"])
     @_login_required
@@ -328,7 +386,7 @@ def create_app():
             return jsonify({"error": "fingerprintTemplate (base64) is required"}), 400
 
         # Use repo helper to write the template blob
-        return set_resident_fingerprint(resident_id, template_b64)
+        return set_resident_fingerprint(resident_id, template_b64, session["user_id"])
 
     if os.getenv("DISABLE_NOTIFICATION_WORKER", "").lower() not in {"1", "true", "yes", "on"} and os.getenv("PYTEST_CURRENT_TEST") is None:
         if os.environ.get("WERKZEUG_RUN_MAIN") in {None, "true"}:

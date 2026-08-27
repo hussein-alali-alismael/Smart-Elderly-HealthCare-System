@@ -69,7 +69,7 @@ Set `SEHCS_TTS_VOICE=ar` for Arabic on a Pi if the Arabic voice is installed;
 use `en` for English. Available voices depend on the operating system and
 installed speech packages.
 
-The bridge uses the AS608's internal fingerprint search for normal check-in. The sensor position is sent to Flask as `fingerprint_id`; Flask treats that position as the resident id for this test setup. Raw templates are sent only during enrollment.
+The bridge uses the AS608's internal fingerprint search for normal check-in and sends the captured `fingerprintTemplate` to Flask. Configure the same `FINGERPRINT_DEVICE_TOKEN` on the Pi and Flask server. Flask performs the resident match from the captured template; a sensor position or resident id alone is not accepted.
 
 Enroll one fingerprint for resident 7:
 

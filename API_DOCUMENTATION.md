@@ -347,6 +347,8 @@ Returns adherence records.
 
 Possible intake statuses from the database: `pending`, `taken`, `missed`, `refused`, `delayed`.
 
+The background medication scheduler creates one `pending` intake for each valid schedule time for the current day. Once the planned time has passed the configured announcement window, an unconfirmed `pending` intake is changed to `missed`. Fingerprint confirmation changes that day's intake to `taken`; confirmed or manually resolved statuses are not overwritten by the scheduler.
+
 Frontend pages:
 
 1. Medication schedule list grouped by resident.
@@ -400,6 +402,8 @@ Request:
 
 #### `POST /api/fingerprint-checkin`
 
+This endpoint is for the trusted Raspberry Pi client, not anonymous browser/API callers. Every request must include the `X-Fingerprint-Token` header containing the value configured as `FINGERPRINT_DEVICE_TOKEN` on the Flask server. The request must also include the captured `fingerprintTemplate`; a `fingerprint_id`, sensor position, or resident ID by itself is rejected and cannot record an intake.
+
 Runs the complete fingerprint medication workflow:
 
 1. Match the fingerprint to a resident.
@@ -410,11 +414,11 @@ Runs the complete fingerprint medication workflow:
 Accepted request examples:
 
 ```json
-{ "fingerprint_id": 7 }
-```
-
-```json
-{ "fingerprintTemplate": "BASE64_ENCODED_TEMPLATE" }
+{
+  "fingerprintTemplate": "BASE64_ENCODED_TEMPLATE",
+  "sensor_position": 7,
+  "accuracy": 80
+}
 ```
 
 Success response shape:
@@ -459,6 +463,12 @@ Success response shape:
 ```
 
 Failure responses use HTTP `200` with `success: false` for workflow decisions such as unknown fingerprint or no medication scheduled. The frontend should inspect `success`, `step`, and `message`, not only the HTTP status.
+
+#### `POST /api/fall-alerts`
+
+Receives a fall detector event and persists it. The receiver performs parsing, criticality validation, and database storage only; it does not dispatch another webhook, preventing a self-calling loop. A critical event is acknowledged with `201` after it is stored.
+
+For a critical event, the response also includes `audio_alerted`. Set `SEHCS_SERVER_VOICE_ENABLED=true` on the Flask server to enable the spoken emergency announcement.
 
 Possible failure steps:
 
@@ -547,6 +557,8 @@ The kiosk should:
 2. Display `message` immediately.
 3. On success, display the resident and medication from `result`.
 4. On failure, display a clear retry instruction based on `step`.
+
+The diagnostic route `/api/_debug/routes` is disabled unless `ENABLE_DEBUG_ROUTES=1` is explicitly configured, and remains login-protected when enabled.
 
 ## 6. Frontend API helper recommendation
 

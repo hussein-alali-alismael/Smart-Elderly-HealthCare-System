@@ -9,12 +9,16 @@ from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
 from repo import get_db_connection
+from voice import server_voice_enabled, speak
 
 load_dotenv()
 
-FLASK_RUN_HOST = os.getenv("FLASK_RUN_HOST", "0.0.0.0")
-FLASK_RUN_PORT = os.getenv("FLASK_RUN_PORT", "5000")
-BACKEND_API_URL = f"http://{FLASK_RUN_HOST}:{FLASK_RUN_PORT}/api/fall-alerts"
+BACKEND_API_HOST = os.getenv("BACKEND_API_HOST", "127.0.0.1")
+BACKEND_API_PORT = os.getenv("FLASK_RUN_PORT", os.getenv("PORT", "5000"))
+BACKEND_API_URL = os.getenv(
+    "BACKEND_API_URL",
+    f"http://{BACKEND_API_HOST}:{BACKEND_API_PORT}/api/fall-alerts",
+)
 DEFAULT_RESIDENT_ID = os.getenv("FALL_ALERT_DEFAULT_RESIDENT_ID") or None
 DEFAULT_DEVICE_ID = os.getenv("FALL_ALERT_DEVICE_ID") or None
 DEFAULT_LOCATION = os.getenv("FALL_ALERT_LOCATION") or None
@@ -73,7 +77,11 @@ class FallDetectionPipeline:
             return True
         return False
 
-    def node_3_push_emergency_to_db(self, event: FallEventRecord) -> bool:
+    def node_3_push_emergency_to_db(
+        self,
+        event: FallEventRecord,
+        create_notification: bool = True,
+    ) -> bool:
         connection = get_db_connection()
         if connection is None:
             return False
@@ -97,7 +105,7 @@ class FallDetectionPipeline:
 
                 # notifications.residentId is intentionally NOT NULL. Only
                 # create a resident notification after identity is known.
-                if event.resident_id is not None:
+                if create_notification and event.resident_id is not None:
                     cursor.execute(
                         """
                         INSERT INTO notifications (residentId, type, message, isSent, sentAt, isRead)
@@ -122,6 +130,12 @@ class FallDetectionPipeline:
         except requests.RequestException:
             return self._trigger_local_fallback_alarm(event)
 
+    def node_5_trigger_audio_alarm(self, event: FallEventRecord) -> bool:
+        """Announce a confirmed fall through the server's configured speaker."""
+        resident = f" for resident {event.resident_id}" if event.resident_id is not None else ""
+        message = f"Emergency! Fall detected{resident}. Please provide assistance immediately."
+        return speak(message, enabled=server_voice_enabled())
+
     def _trigger_local_fallback_alarm(self, event: FallEventRecord) -> bool:
         print(f"CRITICAL: Webhook failed. Local Fallback Active for Resident ID {event.resident_id}!")
         return True
@@ -133,14 +147,17 @@ class FallDetectionPipeline:
 
         is_critical = self.node_2_verify_criticality(event)
         if not is_critical:
-            return {"status": "logged", "data": asdict(event)}
+            db_saved = self.node_3_push_emergency_to_db(event, create_notification=False)
+            return {"status": "logged", "db_synced": db_saved, "data": asdict(event)}
 
         db_saved = self.node_3_push_emergency_to_db(event)
+        audio_alerted = self.node_5_trigger_audio_alarm(event)
         network_dispatched = self.node_4_dispatch_live_webhook(event)
 
         return {
             "status": "dispatched",
             "db_synced": db_saved,
+            "audio_alerted": audio_alerted,
             "live_alert_sent": network_dispatched,
             "event_details": asdict(event)
         }

@@ -179,7 +179,7 @@ Then scan the enrolled finger:
 python fingerprint_sensor_bridge.py --server http://<WINDOWS_LAPTOP_IP>:5000 --device /dev/serial0 --once
 ```
 
-The bridge sends a recognized sensor position as `fingerprint_id`. For this project’s current test mapping, that number is treated as the resident ID. The Flask fingerprint agent then checks today’s active medication schedules and records a `taken` intake when a schedule is within the configured announcement window.
+The bridge sends the captured fingerprint template and the sensor result as `fingerprintTemplate` plus metadata. Flask requires the `FINGERPRINT_DEVICE_TOKEN` header and matches the captured template against the resident template before checking today’s active medication schedules and recording a `taken` intake. A sensor position or resident ID alone is rejected.
 
 ## 4. Run the Pi bridge at startup
 
@@ -234,11 +234,16 @@ A React frontend running on port `3000` or `5173` should use a development proxy
 | `DB_NAME` | `elderly_healthcare_v3` |
 | `FLASK_RUN_HOST` | Flask host, use `0.0.0.0` for Pi/LAN access |
 | `FLASK_RUN_PORT` / `PORT` | Flask port, normally `5000` |
+| `BACKEND_API_HOST` | Reachable backend host for the fall detector, normally `127.0.0.1` |
+| `BACKEND_API_URL` | Optional full fall-alert URL override |
+| `SEHCS_SERVER_VOICE_ENABLED` | Enable Flask-side spoken medication and fall alerts |
+| `ENABLE_DEBUG_ROUTES` | Enable the diagnostic routes only for local development; default `0` |
 | `ANNOUNCEMENT_WINDOW_MINUTES` | Fingerprint/reminder matching window, default `10` |
 | `MONITOR_INTERVAL_SECONDS` | Background worker interval, default `300` |
 | `DISABLE_NOTIFICATION_WORKER` | Set `1` to disable the background worker |
 | `GEMINI_API_KEY` | Optional key for the chatbot feature |
 | `GEMINI_MODEL` | Optional Gemini model name |
+| `FINGERPRINT_DEVICE_TOKEN` | Shared secret required by the Raspberry Pi fingerprint client |
 
 ## 7. Troubleshooting
 

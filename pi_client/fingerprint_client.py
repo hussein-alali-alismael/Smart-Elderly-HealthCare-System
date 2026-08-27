@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from typing import Any, Dict
@@ -24,13 +25,20 @@ DEFAULT_RETRY_SECONDS = 5
 DEFAULT_TIMEOUT = 6
 
 
-def send_payload(server: str, payload: Dict[str, Any], retries: int = 5) -> Dict[str, Any]:
+def send_payload(
+    server: str,
+    payload: Dict[str, Any],
+    retries: int = 5,
+    device_token: str | None = None,
+) -> Dict[str, Any]:
     url = server.rstrip("/") + "/api/fingerprint-checkin"
+    token = device_token or os.getenv("FINGERPRINT_DEVICE_TOKEN", "")
+    headers = {"X-Fingerprint-Token": token} if token else {}
     attempt = 0
     while True:
         attempt += 1
         try:
-            resp = requests.post(url, json=payload, timeout=DEFAULT_TIMEOUT)
+            resp = requests.post(url, json=payload, headers=headers, timeout=DEFAULT_TIMEOUT)
             try:
                 body = resp.json()
             except Exception:
@@ -50,6 +58,11 @@ def main(argv=None):
     group.add_argument("--id", type=int, help="Resident numeric id to simulate (fingerprint matched to this id)")
     group.add_argument("--file", help="Path to a JSON file to send as payload")
     parser.add_argument("--retries", type=int, default=5)
+    parser.add_argument(
+        "--token",
+        default=os.getenv("FINGERPRINT_DEVICE_TOKEN", ""),
+        help="Shared token configured as FINGERPRINT_DEVICE_TOKEN",
+    )
     args = parser.parse_args(argv)
 
     if args.file:
@@ -59,7 +72,7 @@ def main(argv=None):
         payload = {"resident_id": args.id}
 
     print(f"Sending payload to {args.server}: {payload}")
-    result = send_payload(args.server, payload, retries=args.retries)
+    result = send_payload(args.server, payload, retries=args.retries, device_token=args.token)
     print("Result:", json.dumps(result, indent=2, ensure_ascii=False))
 
 

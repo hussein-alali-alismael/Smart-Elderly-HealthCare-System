@@ -23,6 +23,12 @@ def connect_to_database():
         database=database,
         charset="utf8mb4",
         cursorclass=pymysql.cursors.DictCursor,
+        # The worker reuses this connection for hours.  With PyMySQL's
+        # default autocommit=False, the first SELECT would keep an InnoDB
+        # REPEATABLE READ snapshot open until an explicit commit/rollback.
+        # Autocommit gives every statement its own transaction, so later
+        # worker cycles see schedules added by the web application.
+        autocommit=True,
     )
     
 def get_db_connection():
@@ -34,6 +40,10 @@ def get_db_connection():
             connection.ping(reconnect=True)
             return connection
         except Exception:
+            try:
+                connection.close()
+            except Exception:
+                pass
             _db_connections.connection = None
 
     try:
@@ -222,6 +232,11 @@ def alerts(user_id=None):
         if connection is None:
             return jsonify({"error": "Database is not available."}), 503
 
+        sent_date = (
+            sent_at.date().isoformat()
+            if isinstance(sent_at, datetime)
+            else str(sent_at)[:10]
+        )
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -311,9 +326,10 @@ def create_notification(payload, user_id=None):
                 WHERE residentId = %s
                   AND type = %s
                   AND message = %s
+                                    AND DATE(sentAt) = %s
                 LIMIT 1
                 """,
-                (resident_id, notification_type, message),
+                                (resident_id, notification_type, message, sent_date),
             )
             existing = cursor.fetchone()
             if existing is not None:
@@ -546,7 +562,7 @@ def list_medication_intakes(user_id=None):
         return jsonify({"intakes": intakes})
 
 
-def list_resident_medical_conditions():
+def list_resident_medical_conditions(user_id=None):
         connection = get_db_connection()
         if connection is None:
             return jsonify({"error": "Database is not available."}), 503
@@ -559,14 +575,15 @@ def list_resident_medical_conditions():
                 FROM elderly_resident_medical_conditions ermc
                 LEFT JOIN elderly_residents r ON r.id = ermc.residentId
                 LEFT JOIN medical_conditions mc ON mc.id = ermc.conditionId
+                WHERE r.user_id = %s
                 ORDER BY ermc.residentId ASC, ermc.conditionId ASC
-                """
+                """, (user_id,)
             )
             resident_conditions = cursor.fetchall()
         return jsonify({"resident_conditions": resident_conditions})
 
 
-def set_resident_fingerprint(resident_id, template_b64):
+def set_resident_fingerprint(resident_id, template_b64, user_id=None):
         """Store a base64-encoded fingerprint template into elderly_residents.fingerprintTemplate.
 
         Returns a Flask JSON response.
@@ -588,13 +605,16 @@ def set_resident_fingerprint(resident_id, template_b64):
             return jsonify({"error": "Database is not available."}), 503
 
         with connection.cursor() as cursor:
-            cursor.execute("SELECT id FROM elderly_residents WHERE id = %s", (resident_id,))
+            cursor.execute(
+                "SELECT id FROM elderly_residents WHERE id = %s AND user_id = %s",
+                (resident_id, user_id),
+            )
             if cursor.fetchone() is None:
                 return jsonify({"error": "Resident not found."}), 404
 
             cursor.execute(
-                "UPDATE elderly_residents SET fingerprintTemplate = %s WHERE id = %s",
-                (template_bytes, resident_id),
+                "UPDATE elderly_residents SET fingerprintTemplate = %s WHERE id = %s AND user_id = %s",
+                (template_bytes, resident_id, user_id),
             )
         connection.commit()
 

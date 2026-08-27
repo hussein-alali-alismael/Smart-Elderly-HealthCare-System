@@ -140,6 +140,12 @@ class FingerprintMedicationAgent:
     def node_1_find_resident_by_fingerprint(self, fingerprint_input: FingerprintInput) -> Optional[FingerprintResident]:
         """Find the resident that matches the fingerprint input."""
         mode, value = self._normalize_fingerprint_input(fingerprint_input)
+        if mode == "resident_id":
+            # A sensor slot/position is not proof of identity: clients can
+            # forge it in a JSON request. Require the actual captured template
+            # so the database performs the fingerprint match.
+            return None
+
         connection = get_db_connection()
         if connection is None:
             return None
@@ -251,7 +257,12 @@ class FingerprintMedicationAgent:
     @staticmethod
     def _planned_datetime_for_today(now: datetime, time_of_day: str) -> datetime:
         schedule_time = datetime.strptime(time_of_day, "%H:%M:%S").time()
-        return datetime.combine(now.date(), schedule_time)
+        candidate = datetime.combine(now.date(), schedule_time)
+        if candidate - now > timedelta(hours=12):
+            candidate -= timedelta(days=1)
+        elif now - candidate > timedelta(hours=12):
+            candidate += timedelta(days=1)
+        return candidate
 
     def node_5_choose_nearest_medication_time(
         self,
@@ -291,14 +302,14 @@ class FingerprintMedicationAgent:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id
+                SELECT id, status, actualIntakeDateTime
                 FROM medication_intakes
                 WHERE medicationScheduleTimeId = %s
                   AND DATE(plannedIntakeDateTime) = %s
                 ORDER BY id DESC
                 LIMIT 1
                 """,
-                (schedule.schedule_time_id, now.date().isoformat()),
+                (schedule.schedule_time_id, planned_datetime.date().isoformat()),
             )
             existing = cursor.fetchone()
 
@@ -328,6 +339,11 @@ class FingerprintMedicationAgent:
                     ),
                 )
                 intake_row_id = cursor.lastrowid
+            elif existing.get("status") == "taken":
+                # A second scan is an idempotent confirmation. Preserve the
+                # first actual intake time instead of overwriting the evidence.
+                intake_row_id = existing["id"]
+                actual_datetime_text = str(existing.get("actualIntakeDateTime") or actual_datetime_text)
             else:
                 intake_row_id = existing["id"]
                 cursor.execute(
