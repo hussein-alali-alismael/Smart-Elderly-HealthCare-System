@@ -260,17 +260,19 @@ def run_once_sensor_mode(
             }
 
         print("Sending payload to fingerprint check-in endpoint...")
-        # Do not send the raw template for normal check-in: each scan can
-        # produce different characteristics. The AS608 search position is the
-        # reliable identification result used by the Flask agent.
-        # Enrollment stores the resident's template in the same AS608 slot as
-        # the resident id, so the search position identifies the resident.
+        # Include the actual fingerprint template for lookups against the
+        # stored resident templates. The AS608 slot number is only a weak hint,
+        # and it may not match the enrolled resident ID if the sensor memory is
+        # not aligned or stale templates remain in other positions.
         resident_id = position_number
         result = send_payload(
             server,
             {
-            "fingerprint_id": resident_id,
+                "resident_id": resident_id,
+                "fingerprint_id": resident_id,
+                "fingerprintTemplate": template_b64,
                 "sensor_position": position_number,
+                "fingerprintSensorSlot": position_number,
                 "accuracy": accuracy_score,
             },
             retries=retries,

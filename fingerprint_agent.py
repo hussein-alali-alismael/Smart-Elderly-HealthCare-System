@@ -102,15 +102,23 @@ class FingerprintMedicationAgent:
         sensor response is confirmed.
         """
         if isinstance(fingerprint_input, dict):
+            # Authenticated sensor payloads should prefer the trusted slot mapping,
+            # because AS608 template bytes vary per scan even for the same finger.
+            for key in ("resident_id", "residentId"):
+                if key in fingerprint_input and fingerprint_input[key] is not None:
+                    return "resident_id", fingerprint_input[key]
+
+            for key in ("fingerprintSensorSlot", "sensor_position", "sensorPosition"):
+                if key in fingerprint_input and fingerprint_input[key] is not None:
+                    return "sensor_slot", int(fingerprint_input[key])
+
             for key in ("fingerprintTemplate", "template"):
                 if key in fingerprint_input and fingerprint_input[key] is not None:
                     return key, fingerprint_input[key]
 
-            # The AS608 bridge sends its internal search position. For this
-            # test setup, that position is mapped to the resident id.
-            for key in ("fingerprint_id", "fingerprintId", "residentId", "resident_id", "id"):
+            for key in ("fingerprint_id", "fingerprintId", "id"):
                 if key in fingerprint_input and fingerprint_input[key] is not None:
-                    return "resident_id", fingerprint_input[key]
+                    return "untrusted_numeric", fingerprint_input[key]
 
             raise ValueError("Fingerprint payload dictionary does not contain a usable identifier.")
 
@@ -139,11 +147,13 @@ class FingerprintMedicationAgent:
 
     def node_1_find_resident_by_fingerprint(self, fingerprint_input: FingerprintInput) -> Optional[FingerprintResident]:
         """Find the resident that matches the fingerprint input."""
+        if isinstance(fingerprint_input, (int, str)):
+            text_value = str(fingerprint_input).strip()
+            if text_value.isdigit() or (text_value.startswith("-") and text_value[1:].isdigit()):
+                return None
+
         mode, value = self._normalize_fingerprint_input(fingerprint_input)
-        if mode == "resident_id":
-            # A sensor slot/position is not proof of identity: clients can
-            # forge it in a JSON request. Require the actual captured template
-            # so the database performs the fingerprint match.
+        if mode == "untrusted_numeric":
             return None
 
         connection = get_db_connection()
@@ -151,7 +161,7 @@ class FingerprintMedicationAgent:
             return None
 
         query = """
-            SELECT id, name, fingerprintTemplate
+            SELECT id, name, fingerprintTemplate, fingerprintSensorSlot
             FROM elderly_residents
             WHERE fingerprintTemplate IS NOT NULL
         """
@@ -159,9 +169,17 @@ class FingerprintMedicationAgent:
 
         if mode == "resident_id":
             query = """
-                SELECT id, name, fingerprintTemplate
+                SELECT id, name, fingerprintTemplate, fingerprintSensorSlot
                 FROM elderly_residents
                 WHERE id = %s
+                LIMIT 1
+            """
+            params = (value,)
+        elif mode == "sensor_slot":
+            query = """
+                SELECT id, name, fingerprintTemplate, fingerprintSensorSlot
+                FROM elderly_residents
+                WHERE fingerprintSensorSlot = %s
                 LIMIT 1
             """
             params = (value,)

@@ -77,12 +77,35 @@ def ensure_medication_ownership():
                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'medications'
                AND COLUMN_NAME = 'user_id'"""
         )
-        if cursor.fetchone()["count"] == 0:
+        column_count = cursor.fetchone()
+        if column_count is not None and column_count["count"] == 0:
             cursor.execute("ALTER TABLE medications ADD COLUMN user_id INT NULL AFTER id")
             default_user_id = get_default_user_id(connection)
             if default_user_id is not None:
                 cursor.execute("UPDATE medications SET user_id = %s WHERE user_id IS NULL", (default_user_id,))
             cursor.execute("CREATE INDEX idx_medications_user_id ON medications (user_id)")
+    connection.commit()
+
+
+def ensure_fingerprint_sensor_mapping():
+    """Ensure residents store the AS608 sensor slot used for this resident."""
+    connection = get_db_connection()
+    if connection is None:
+        return
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """SELECT COUNT(*) AS count FROM information_schema.COLUMNS
+               WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'elderly_residents'
+               AND COLUMN_NAME = 'fingerprintSensorSlot'"""
+        )
+        column_count = cursor.fetchone()
+        if column_count is not None and column_count["count"] == 0:
+            cursor.execute(
+                "ALTER TABLE elderly_residents ADD COLUMN fingerprintSensorSlot INT NULL AFTER fingerprintTemplate"
+            )
+            cursor.execute(
+                "CREATE INDEX idx_elderly_residents_fingerprint_sensor_slot ON elderly_residents (fingerprintSensorSlot)"
+            )
     connection.commit()
 
 
@@ -232,11 +255,6 @@ def alerts(user_id=None):
         if connection is None:
             return jsonify({"error": "Database is not available."}), 503
 
-        sent_date = (
-            sent_at.date().isoformat()
-            if isinstance(sent_at, datetime)
-            else str(sent_at)[:10]
-        )
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -314,6 +332,8 @@ def create_notification(payload, user_id=None):
         connection = get_db_connection()
         if connection is None:
             return jsonify({"error": "Database is not available."}), 503
+
+        sent_date = str(sent_at)[:10]
 
         with connection.cursor() as cursor:
             cursor.execute("SELECT id FROM elderly_residents WHERE id = %s AND user_id = %s", (resident_id, user_id))
@@ -583,8 +603,8 @@ def list_resident_medical_conditions(user_id=None):
         return jsonify({"resident_conditions": resident_conditions})
 
 
-def set_resident_fingerprint(resident_id, template_b64, user_id=None):
-        """Store a base64-encoded fingerprint template into elderly_residents.fingerprintTemplate.
+def set_resident_fingerprint(resident_id, template_b64, user_id=None, sensor_position=None):
+        """Store a base64-encoded fingerprint template and sensor slot in the resident row.
 
         Returns a Flask JSON response.
         """
@@ -600,22 +620,505 @@ def set_resident_fingerprint(resident_id, template_b64, user_id=None):
         except Exception as exc:
             return jsonify({"error": f"Invalid base64 template: {exc}"}), 400
 
+        sensor_slot = sensor_position if sensor_position is not None else resident_id
+
         connection = get_db_connection()
         if connection is None:
             return jsonify({"error": "Database is not available."}), 503
 
         with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT id FROM elderly_residents WHERE id = %s AND user_id = %s",
-                (resident_id, user_id),
-            )
-            if cursor.fetchone() is None:
-                return jsonify({"error": "Resident not found."}), 404
+            if user_id is not None:
+                cursor.execute(
+                    "SELECT id FROM elderly_residents WHERE id = %s AND user_id = %s",
+                    (resident_id, user_id),
+                )
+                if cursor.fetchone() is None:
+                    return jsonify({"error": "Resident not found."}), 404
 
-            cursor.execute(
-                "UPDATE elderly_residents SET fingerprintTemplate = %s WHERE id = %s AND user_id = %s",
-                (template_bytes, resident_id, user_id),
-            )
+                cursor.execute(
+                    "UPDATE elderly_residents SET fingerprintTemplate = %s, fingerprintSensorSlot = %s WHERE id = %s AND user_id = %s",
+                    (template_bytes, sensor_slot, resident_id, user_id),
+                )
+            else:
+                cursor.execute(
+                    "SELECT id FROM elderly_residents WHERE id = %s",
+                    (resident_id,),
+                )
+                if cursor.fetchone() is None:
+                    return jsonify({"error": "Resident not found."}), 404
+
+                cursor.execute(
+                    "UPDATE elderly_residents SET fingerprintTemplate = %s, fingerprintSensorSlot = %s WHERE id = %s",
+                    (template_bytes, sensor_slot, resident_id),
+                )
         connection.commit()
 
-        return jsonify({"status": "updated", "resident_id": resident_id}), 200
+        return jsonify({"status": "updated", "resident_id": resident_id, "sensor_slot": sensor_slot}), 200
+
+
+# ---------------------------------------------------------------------------
+# Authenticated CRUD helpers.  Every function below receives the owner from
+# the Flask session; none of these paths falls back to the first database user.
+# ---------------------------------------------------------------------------
+
+def _db_or_error():
+    connection = get_db_connection()
+    return connection or None
+
+
+def get_resident(resident_id, user_id):
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT id, user_id, name, dateOfBirth, notes, createdAt, updatedAt FROM elderly_residents WHERE id = %s AND user_id = %s", (resident_id, user_id))
+        row = cursor.fetchone()
+    return (jsonify(row), 200) if row else (jsonify({"error": "Resident not found."}), 404)
+
+
+def update_resident(resident_id, payload, user_id):
+    name = str(payload.get("name", "")).strip()
+    date_of_birth = payload.get("dateOfBirth")
+    notes = str(payload.get("notes", "")).strip() or None
+    if not name:
+        return jsonify({"error": "Please provide a resident name."}), 400
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    with connection.cursor() as cursor:
+        cursor.execute("UPDATE elderly_residents SET name = %s, dateOfBirth = %s, notes = %s WHERE id = %s AND user_id = %s", (name, date_of_birth, notes, resident_id, user_id))
+        if cursor.rowcount == 0:
+            return jsonify({"error": "Resident not found."}), 404
+    connection.commit()
+    return get_resident(resident_id, user_id)
+
+
+def delete_resident(resident_id, user_id):
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    with connection.cursor() as cursor:
+        cursor.execute("DELETE FROM elderly_residents WHERE id = %s AND user_id = %s", (resident_id, user_id))
+        if cursor.rowcount == 0:
+            return jsonify({"error": "Resident not found."}), 404
+    connection.commit()
+    return jsonify({"status": "deleted", "id": resident_id})
+
+
+def get_medication(medication_id, user_id):
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT id, name, dosage, form, manufacturer, sideEffects, instructions, contraindications, createdAt, updatedAt FROM medications WHERE id = %s AND user_id = %s", (medication_id, user_id))
+        row = cursor.fetchone()
+    return (jsonify(row), 200) if row else (jsonify({"error": "Medication not found."}), 404)
+
+
+def delete_medication(medication_id, user_id):
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    with connection.cursor() as cursor:
+        cursor.execute("DELETE FROM medications WHERE id = %s AND user_id = %s", (medication_id, user_id))
+        if cursor.rowcount == 0:
+            return jsonify({"error": "Medication not found."}), 404
+    connection.commit()
+    return jsonify({"status": "deleted", "id": medication_id})
+
+
+def create_medication_schedule(payload, user_id):
+    resident_id = payload.get("residentId")
+    medication_id = payload.get("medicationId")
+    frequency = str(payload.get("frequency", "")).strip()
+    start_date = payload.get("startDate")
+    end_date = payload.get("endDate") or None
+    if not resident_id or not medication_id or not frequency or not start_date:
+        return jsonify({"error": "residentId, medicationId, frequency, and startDate are required."}), 400
+    if end_date and str(start_date) > str(end_date):
+        return jsonify({"error": "startDate must not be after endDate."}), 400
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT id FROM elderly_residents WHERE id = %s AND user_id = %s", (resident_id, user_id))
+        if cursor.fetchone() is None:
+            return jsonify({"error": "Resident not found."}), 404
+        cursor.execute("SELECT id FROM medications WHERE id = %s AND user_id = %s", (medication_id, user_id))
+        if cursor.fetchone() is None:
+            return jsonify({"error": "Medication not found."}), 404
+        cursor.execute("INSERT INTO medication_schedules (residentId, medicationId, frequency, startDate, endDate, isActive, notes) VALUES (%s, %s, %s, %s, %s, %s, %s)", (resident_id, medication_id, frequency, start_date, end_date, int(bool(payload.get("isActive", 1))), payload.get("notes")))
+        schedule_id = cursor.lastrowid
+    connection.commit()
+    return get_medication_schedule(schedule_id, user_id, 201)
+
+
+def get_medication_schedule(schedule_id, user_id, status=200):
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT ms.id, ms.residentId, ms.medicationId, ms.frequency, ms.startDate, ms.endDate, ms.isActive, ms.notes, ms.createdAt, ms.updatedAt FROM medication_schedules ms INNER JOIN elderly_residents r ON r.id = ms.residentId AND r.user_id = %s WHERE ms.id = %s", (user_id, schedule_id))
+        row = cursor.fetchone()
+    return (jsonify(row), status) if row else (jsonify({"error": "Schedule not found."}), 404)
+
+
+def update_medication_schedule(schedule_id, payload, user_id):
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    fields = {"frequency": payload.get("frequency"), "startDate": payload.get("startDate"), "endDate": payload.get("endDate") or None, "isActive": int(bool(payload.get("isActive", 1))), "notes": payload.get("notes")}
+    if not fields["frequency"] or not fields["startDate"]:
+        return jsonify({"error": "frequency and startDate are required."}), 400
+    if fields["endDate"] and str(fields["startDate"]) > str(fields["endDate"]):
+        return jsonify({"error": "startDate must not be after endDate."}), 400
+    with connection.cursor() as cursor:
+        cursor.execute("UPDATE medication_schedules ms INNER JOIN elderly_residents r ON r.id = ms.residentId AND r.user_id = %s SET ms.frequency=%s, ms.startDate=%s, ms.endDate=%s, ms.isActive=%s, ms.notes=%s WHERE ms.id=%s", (user_id, fields["frequency"], fields["startDate"], fields["endDate"], fields["isActive"], fields["notes"], schedule_id))
+        if cursor.rowcount == 0:
+            return jsonify({"error": "Schedule not found."}), 404
+    connection.commit()
+    return get_medication_schedule(schedule_id, user_id)
+
+
+def delete_medication_schedule(schedule_id, user_id):
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    with connection.cursor() as cursor:
+        cursor.execute("DELETE ms FROM medication_schedules ms INNER JOIN elderly_residents r ON r.id = ms.residentId AND r.user_id = %s WHERE ms.id = %s", (user_id, schedule_id))
+        if cursor.rowcount == 0:
+            return jsonify({"error": "Schedule not found."}), 404
+    connection.commit()
+    return jsonify({"status": "deleted", "id": schedule_id})
+
+
+def list_schedule_times_for_schedule(schedule_id, user_id):
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT mst.id, mst.scheduleId, mst.timeOfDay, mst.createdAt, mst.updatedAt FROM medication_schedule_times mst INNER JOIN medication_schedules ms ON ms.id = mst.scheduleId INNER JOIN elderly_residents r ON r.id = ms.residentId AND r.user_id = %s WHERE mst.scheduleId = %s ORDER BY mst.id", (user_id, schedule_id))
+        rows = cursor.fetchall()
+    return jsonify({"schedule_times": rows})
+
+
+def create_schedule_time(schedule_id, payload, user_id):
+    time_of_day = payload.get("timeOfDay")
+    if not time_of_day:
+        return jsonify({"error": "timeOfDay is required."}), 400
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT ms.id FROM medication_schedules ms INNER JOIN elderly_residents r ON r.id = ms.residentId AND r.user_id = %s WHERE ms.id = %s", (user_id, schedule_id))
+        if cursor.fetchone() is None:
+            return jsonify({"error": "Schedule not found."}), 404
+        cursor.execute("SELECT id FROM medication_schedule_times WHERE scheduleId = %s AND timeOfDay = %s", (schedule_id, time_of_day))
+        if cursor.fetchone() is not None:
+            return jsonify({"error": "This schedule time already exists."}), 409
+        cursor.execute("INSERT INTO medication_schedule_times (scheduleId, timeOfDay) VALUES (%s, %s)", (schedule_id, time_of_day))
+        time_id = cursor.lastrowid
+    connection.commit()
+    return jsonify({"id": time_id, "scheduleId": schedule_id, "timeOfDay": time_of_day}), 201
+
+
+def update_schedule_time(time_id, payload, user_id):
+    time_of_day = payload.get("timeOfDay")
+    if not time_of_day:
+        return jsonify({"error": "timeOfDay is required."}), 400
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    with connection.cursor() as cursor:
+        cursor.execute("UPDATE medication_schedule_times mst INNER JOIN medication_schedules ms ON ms.id = mst.scheduleId INNER JOIN elderly_residents r ON r.id = ms.residentId AND r.user_id = %s SET mst.timeOfDay = %s WHERE mst.id = %s", (user_id, time_of_day, time_id))
+        if cursor.rowcount == 0:
+            return jsonify({"error": "Schedule time not found."}), 404
+    connection.commit()
+    return jsonify({"id": time_id, "timeOfDay": time_of_day, "status": "updated"})
+
+
+def delete_schedule_time(time_id, user_id):
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    with connection.cursor() as cursor:
+        cursor.execute("DELETE mst FROM medication_schedule_times mst INNER JOIN medication_schedules ms ON ms.id = mst.scheduleId INNER JOIN elderly_residents r ON r.id = ms.residentId AND r.user_id = %s WHERE mst.id = %s", (user_id, time_id))
+        if cursor.rowcount == 0:
+            return jsonify({"error": "Schedule time not found."}), 404
+    connection.commit()
+    return jsonify({"status": "deleted", "id": time_id})
+
+
+def get_intake(intake_id, user_id):
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT mi.* FROM medication_intakes mi INNER JOIN medication_schedule_times mst ON mst.id = mi.medicationScheduleTimeId INNER JOIN medication_schedules ms ON ms.id = mst.scheduleId INNER JOIN elderly_residents r ON r.id = ms.residentId AND r.user_id = %s WHERE mi.id = %s", (user_id, intake_id))
+        row = cursor.fetchone()
+    return (jsonify(row), 200) if row else (jsonify({"error": "Intake not found."}), 404)
+
+
+def update_intake(intake_id, payload, user_id):
+    status = payload.get("status")
+    allowed = {"pending", "taken", "missed", "refused", "delayed"}
+    if status not in allowed:
+        return jsonify({"error": "Invalid intake status."}), 400
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    actual = payload.get("actualIntakeDateTime") if status == "taken" else None
+    with connection.cursor() as cursor:
+        cursor.execute("UPDATE medication_intakes mi INNER JOIN medication_schedule_times mst ON mst.id = mi.medicationScheduleTimeId INNER JOIN medication_schedules ms ON ms.id = mst.scheduleId INNER JOIN elderly_residents r ON r.id = ms.residentId AND r.user_id = %s SET mi.status=%s, mi.actualIntakeDateTime=%s, mi.confirmedByUserAt=CASE WHEN %s='taken' THEN NOW() ELSE NULL END, mi.notes=%s WHERE mi.id=%s", (user_id, status, actual, status, payload.get("notes"), intake_id))
+        if cursor.rowcount == 0:
+            return jsonify({"error": "Intake not found."}), 404
+    connection.commit()
+    return get_intake(intake_id, user_id)
+
+
+def get_notification(notification_id, user_id):
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT n.* FROM notifications n INNER JOIN elderly_residents r ON r.id = n.residentId AND r.user_id = %s WHERE n.id = %s", (user_id, notification_id))
+        row = cursor.fetchone()
+    return (jsonify(row), 200) if row else (jsonify({"error": "Notification not found."}), 404)
+
+
+def set_notification_read(notification_id, user_id, is_read):
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    with connection.cursor() as cursor:
+        cursor.execute("UPDATE notifications n INNER JOIN elderly_residents r ON r.id = n.residentId AND r.user_id = %s SET n.isRead=%s, n.readAt=CASE WHEN %s=1 THEN NOW() ELSE NULL END WHERE n.id=%s", (user_id, int(is_read), int(is_read), notification_id))
+        if cursor.rowcount == 0:
+            return jsonify({"error": "Notification not found."}), 404
+    connection.commit()
+    return get_notification(notification_id, user_id)
+
+
+def delete_notification(notification_id, user_id):
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    with connection.cursor() as cursor:
+        cursor.execute("DELETE n FROM notifications n INNER JOIN elderly_residents r ON r.id = n.residentId AND r.user_id = %s WHERE n.id=%s", (user_id, notification_id))
+        if cursor.rowcount == 0:
+            return jsonify({"error": "Notification not found."}), 404
+    connection.commit()
+    return jsonify({"status": "deleted", "id": notification_id})
+
+
+def list_contacts(resident_id, user_id):
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT c.* FROM caregiver_contacts c INNER JOIN elderly_residents r ON r.id=c.residentId AND r.user_id=%s WHERE c.residentId=%s ORDER BY c.id", (user_id, resident_id))
+        rows = cursor.fetchall()
+    return jsonify({"contacts": rows})
+
+
+def create_contact(resident_id, payload, user_id):
+    name = str(payload.get("contactName", "")).strip()
+    if not name:
+        return jsonify({"error": "contactName is required."}), 400
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT id FROM elderly_residents WHERE id=%s AND user_id=%s", (resident_id, user_id))
+        if cursor.fetchone() is None:
+            return jsonify({"error": "Resident not found."}), 404
+        cursor.execute("INSERT INTO caregiver_contacts (residentId, contactName, relationship, email, phoneNumber) VALUES (%s,%s,%s,%s,%s)", (resident_id, name, payload.get("relationship"), payload.get("email"), payload.get("phoneNumber")))
+        contact_id = cursor.lastrowid
+    connection.commit()
+    return jsonify({"id": contact_id, "residentId": resident_id, "contactName": name, "status": "created"}), 201
+
+
+def update_contact(contact_id, payload, user_id):
+    name = str(payload.get("contactName", "")).strip()
+    if not name:
+        return jsonify({"error": "contactName is required."}), 400
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    with connection.cursor() as cursor:
+        cursor.execute("UPDATE caregiver_contacts c INNER JOIN elderly_residents r ON r.id=c.residentId AND r.user_id=%s SET c.contactName=%s,c.relationship=%s,c.email=%s,c.phoneNumber=%s WHERE c.id=%s", (user_id, name, payload.get("relationship"), payload.get("email"), payload.get("phoneNumber"), contact_id))
+        if cursor.rowcount == 0:
+            return jsonify({"error": "Contact not found."}), 404
+    connection.commit()
+    return jsonify({"id": contact_id, "contactName": name, "status": "updated"})
+
+
+def delete_contact(contact_id, user_id):
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    with connection.cursor() as cursor:
+        cursor.execute("DELETE c FROM caregiver_contacts c INNER JOIN elderly_residents r ON r.id=c.residentId AND r.user_id=%s WHERE c.id=%s", (user_id, contact_id))
+        if cursor.rowcount == 0:
+            return jsonify({"error": "Contact not found."}), 404
+    connection.commit()
+    return jsonify({"status": "deleted", "id": contact_id})
+
+
+def list_reference_items(table):
+    if table not in {"medical_conditions", "allergies"}:
+        raise ValueError("Invalid reference table")
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    with connection.cursor() as cursor:
+        cursor.execute(f"SELECT id, name, createdAt, updatedAt FROM {table} ORDER BY name")
+        rows = cursor.fetchall()
+    return jsonify({table: rows})
+
+
+def create_reference_item(table, payload):
+    if table not in {"medical_conditions", "allergies"}:
+        raise ValueError("Invalid reference table")
+    name = str(payload.get("name", "")).strip()
+    if not name:
+        return jsonify({"error": "name is required."}), 400
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(f"INSERT INTO {table} (name) VALUES (%s)", (name,))
+            item_id = cursor.lastrowid
+        connection.commit()
+    except pymysql.err.IntegrityError:
+        return jsonify({"error": "An item with this name already exists."}), 409
+    return jsonify({"id": item_id, "name": name, "status": "created"}), 201
+
+
+def update_reference_item(table, item_id, payload):
+    if table not in {"medical_conditions", "allergies"}:
+        raise ValueError("Invalid reference table")
+    name = str(payload.get("name", "")).strip()
+    if not name:
+        return jsonify({"error": "name is required."}), 400
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(f"UPDATE {table} SET name=%s WHERE id=%s", (name, item_id))
+            if cursor.rowcount == 0:
+                return jsonify({"error": "Reference item not found."}), 404
+        connection.commit()
+    except pymysql.err.IntegrityError:
+        return jsonify({"error": "An item with this name already exists."}), 409
+    return jsonify({"id": item_id, "name": name, "status": "updated"})
+
+
+def delete_reference_item(table, item_id):
+    if table not in {"medical_conditions", "allergies"}:
+        raise ValueError("Invalid reference table")
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    with connection.cursor() as cursor:
+        cursor.execute(f"DELETE FROM {table} WHERE id=%s", (item_id,))
+        if cursor.rowcount == 0:
+            return jsonify({"error": "Reference item not found."}), 404
+    connection.commit()
+    return jsonify({"status": "deleted", "id": item_id})
+
+
+def list_resident_relationships(resident_id, user_id, kind):
+    config = {
+        "conditions": ("elderly_resident_medical_conditions", "medical_conditions", "conditionId", "resident_conditions"),
+        "allergies": ("elderly_resident_allergies", "allergies", "allergyId", "resident_allergies"),
+    }
+    if kind not in config:
+        raise ValueError("Invalid relationship type")
+    junction, reference, ref_key, output = config[kind]
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    with connection.cursor() as cursor:
+        cursor.execute(f"SELECT r.id, r.name FROM elderly_residents er INNER JOIN {junction} j ON j.residentId=er.id INNER JOIN {reference} r ON r.id=j.{ref_key} WHERE er.id=%s AND er.user_id=%s ORDER BY r.name", (resident_id, user_id))
+        rows = cursor.fetchall()
+    return jsonify({output: rows})
+
+
+def add_resident_relationship(resident_id, payload, user_id, kind):
+    config = {"conditions": ("elderly_resident_medical_conditions", "medical_conditions", "conditionId"), "allergies": ("elderly_resident_allergies", "allergies", "allergyId")}
+    if kind not in config:
+        raise ValueError("Invalid relationship type")
+    junction, reference, ref_key = config[kind]
+    reference_id = payload.get("conditionId" if kind == "conditions" else "allergyId")
+    if not reference_id:
+        return jsonify({"error": "A reference item id is required."}), 400
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT id FROM elderly_residents WHERE id=%s AND user_id=%s", (resident_id, user_id))
+            if cursor.fetchone() is None:
+                return jsonify({"error": "Resident not found."}), 404
+            cursor.execute(f"SELECT id FROM {reference} WHERE id=%s", (reference_id,))
+            if cursor.fetchone() is None:
+                return jsonify({"error": "Reference item not found."}), 404
+            cursor.execute(f"INSERT INTO {junction} (residentId, {ref_key}) VALUES (%s,%s)", (resident_id, reference_id))
+        connection.commit()
+    except pymysql.err.IntegrityError:
+        return jsonify({"error": "This relationship already exists."}), 409
+    return jsonify({"residentId": resident_id, ref_key: reference_id, "status": "created"}), 201
+
+
+def delete_resident_relationship(resident_id, reference_id, user_id, kind):
+    config = {"conditions": ("elderly_resident_medical_conditions", "conditionId"), "allergies": ("elderly_resident_allergies", "allergyId")}
+    if kind not in config:
+        raise ValueError("Invalid relationship type")
+    junction, ref_key = config[kind]
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    with connection.cursor() as cursor:
+        cursor.execute(f"DELETE j FROM {junction} j INNER JOIN elderly_residents r ON r.id=j.residentId AND r.user_id=%s WHERE j.residentId=%s AND j.{ref_key}=%s", (user_id, resident_id, reference_id))
+        if cursor.rowcount == 0:
+            return jsonify({"error": "Relationship not found."}), 404
+    connection.commit()
+    return jsonify({"status": "deleted", "residentId": resident_id, ref_key: reference_id})
+
+
+def list_fall_incidents(user_id, is_admin=False):
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    with connection.cursor() as cursor:
+        query = "SELECT fi.* FROM fall_incidents fi LEFT JOIN elderly_residents r ON r.id=fi.residentId WHERE %s=1 OR r.user_id=%s ORDER BY fi.detectedAt DESC"
+        cursor.execute(query, (int(is_admin), user_id))
+        rows = cursor.fetchall()
+    return jsonify({"fall_incidents": rows})
+
+
+def get_fall_incident(incident_id, user_id, is_admin=False):
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT fi.* FROM fall_incidents fi LEFT JOIN elderly_residents r ON r.id=fi.residentId WHERE fi.id=%s AND (%s=1 OR r.user_id=%s)", (incident_id, int(is_admin), user_id))
+        row = cursor.fetchone()
+    return (jsonify(row), 200) if row else (jsonify({"error": "Fall incident not found."}), 404)
+
+
+def update_fall_incident(incident_id, payload, user_id, is_admin=False):
+    status = payload.get("status")
+    if status not in {"detected", "confirmed", "false_alarm", "resolved"}:
+        return jsonify({"error": "Invalid fall incident status."}), 400
+    connection = _db_or_error()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
+    with connection.cursor() as cursor:
+        cursor.execute("UPDATE fall_incidents fi LEFT JOIN elderly_residents r ON r.id=fi.residentId SET fi.status=%s, fi.resolutionNotes=%s, fi.resolvedAt=CASE WHEN %s='resolved' THEN NOW() ELSE NULL END WHERE fi.id=%s AND (%s=1 OR r.user_id=%s)", (status, payload.get("resolutionNotes"), status, incident_id, int(is_admin), user_id))
+        if cursor.rowcount == 0:
+            return jsonify({"error": "Fall incident not found."}), 404
+    connection.commit()
+    return jsonify({"id": incident_id, "status": status, "status_message": "updated"})

@@ -223,6 +223,12 @@ The full API contract is in [`API_DOCUMENTATION.md`](API_DOCUMENTATION.md). Impo
 
 A React frontend running on port `3000` or `5173` should use a development proxy or the backend must be configured with CORS. Do not place XAMPP credentials in React environment variables.
 
+For the new frontend build, call `GET /api/auth/csrf` before login or any
+write. Keep the returned `csrfToken` in the `X-CSRFToken` header and send
+requests with credentials. Add the frontend origin, including its port, to
+`FRONTEND_ORIGINS`. A development proxy is preferred because it avoids
+cross-site browser-cookie restrictions.
+
 ## 6. Environment variables
 
 | Variable | Default/use |
@@ -280,8 +286,11 @@ A React frontend running on port `3000` or `5173` should use a development proxy
 
 ## Security notes
 
-- Never commit `.env` or database passwords.
-- The current API has no authentication or authorization layer; use it only on a trusted development network until authentication is added.
-- Restrict Windows Firewall port `5000` to the trusted LAN where possible.
-- Protect or remove `/api/_debug/routes` before production deployment.
+- Never commit `.env` or database passwords. Rotate any credentials that have been exposed.
+- Legacy identity-only login is disabled by default. Configure a real OAuth/OIDC verifier before enabling user login; `AUTH_ALLOW_LEGACY_IDENTITY=1` is only a temporary trusted-network development override.
+- Use a long random `FLASK_SECRET_KEY`, `SESSION_COOKIE_SECURE=1` behind HTTPS, and keep `SESSION_COOKIE_SAMESITE=Strict`.
+- Set separate long random values for `FINGERPRINT_DEVICE_TOKEN` and `FALL_ALERT_DEVICE_TOKEN`; send them in `X-Fingerprint-Token` and `X-Fall-Alert-Token` respectively.
+- Restrict Windows Firewall port `5000` to the trusted LAN where possible and add a reverse proxy with HTTPS for deployment.
+- Keep `ENABLE_DEBUG_ROUTES=0` outside local development.
 - Fingerprint templates are sensitive biometric data; secure the database and restrict enrollment access.
+- The built-in rate limiter is process-local. Use a shared store such as Redis when running multiple Flask workers.

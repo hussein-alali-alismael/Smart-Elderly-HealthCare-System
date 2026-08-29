@@ -40,6 +40,20 @@ The backend uses a session cookie for authentication. The login identity must be
 
 ## 3. Common response and error rules
 
+### CSRF and cross-origin development
+
+Before any `POST`, `PUT`, `PATCH`, or `DELETE`, request `GET /api/auth/csrf`
+with credentials. The response sets a `csrf_token` cookie and returns the same
+value as `csrfToken`. Send that value in the `X-CSRFToken` header and include
+credentials on every request. The backend allows only origins listed in
+`FRONTEND_ORIGINS`.
+
+For local React development, a Vite proxy to Flask is recommended. It keeps
+the browser request same-origin while Flask still serves the API and session.
+If the frontend calls Flask directly from another machine, add its exact origin
+(including port) to `FRONTEND_ORIGINS` and use HTTPS for reliable cross-site
+session cookies.
+
 Successful list responses use a named array property:
 
 - Residents: `{ "residents": [] }`
@@ -67,6 +81,25 @@ Typical status codes:
 Dates use `YYYY-MM-DD`. Datetimes generally use `YYYY-MM-DD HH:MM:SS` or ISO datetime strings. Boolean database flags are returned as `0` or `1`; the React frontend can convert them with `Boolean(value)`.
 
 ## 4. Endpoint reference
+
+## 4A. CRUD endpoint summary
+
+All CRUD routes below require the Flask session created by authentication. The
+repository layer enforces the logged-in user's ownership for residents and all
+resident-owned records. Reference-data writes require an administrator role.
+
+| Entity | Read | Create | Update | Delete/action |
+| --- | --- | --- | --- | --- |
+| Residents | `GET /api/residents`, `GET /api/residents/{id}` | `POST /api/residents` | `PUT/PATCH /api/residents/{id}` | `DELETE /api/residents/{id}` |
+| Medications | `GET /api/medications`, `GET /api/medications/{id}` | `POST /api/medications` | `PUT/PATCH /api/medications/{id}` | `DELETE /api/medications/{id}` |
+| Schedules | `GET /api/medication-schedules`, `GET /api/medication-schedules/{id}` | `POST /api/medication-schedules` | `PUT/PATCH /api/medication-schedules/{id}` | `DELETE /api/medication-schedules/{id}` |
+| Schedule times | `GET/POST /api/medication-schedules/{id}/times` | same | `PUT/PATCH /api/medication-schedule-times/{id}` | `DELETE /api/medication-schedule-times/{id}` |
+| Intakes | `GET /api/medication-intakes`, `GET /api/medication-intakes/{id}` | workflow/worker | `PUT/PATCH /api/medication-intakes/{id}` | — |
+| Notifications | `GET /api/notifications`, `GET /api/notifications/{id}` | `POST /api/notifications` | `/read`, `/unread` actions | `DELETE /api/notifications/{id}` |
+| Contacts | `GET/POST /api/residents/{id}/contacts` | same | `PUT/PATCH /api/contacts/{id}` | `DELETE /api/contacts/{id}` |
+| Conditions/allergies | `GET /api/medical-conditions`, `GET /api/allergies` | admin only | admin only | admin only |
+| Resident relationships | `GET/POST /api/residents/{id}/conditions` or `/allergies` | same | — | `DELETE .../{referenceId}` |
+| Fall incidents | `GET /api/fall-incidents`, `GET /api/fall-incidents/{id}` | device endpoint | `PUT/PATCH /api/fall-incidents/{id}` | review by status |
 
 ### Authentication
 

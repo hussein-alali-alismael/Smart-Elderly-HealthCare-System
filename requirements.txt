@@ -1,7 +1,9 @@
 # Windows Flask/API runtime
 Flask>=3.0,<4.0
+Flask-WTF>=1.2,<2.0
 PyMySQL>=1.1,<2.0
 python-dotenv>=1.0,<2.0
+gunicorn>=22.0,<24.0
 
 # Optional Streamlit chatbot/runtime features
 streamlit>=1.40,<2.0
