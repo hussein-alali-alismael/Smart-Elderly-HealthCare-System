@@ -35,7 +35,7 @@ except ImportError:
 
 # Local helper from the pi_client folder
 try:
-    from fingerprint_client import send_payload
+    from fingerprint_client import send_payload, speak_message, speak_result
 except Exception:
     # If script is executed from another cwd, try to import with path hack
     import importlib.util
@@ -47,11 +47,20 @@ except Exception:
     fingerprint_client = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(fingerprint_client)  # type: ignore
     send_payload = fingerprint_client.send_payload  # type: ignore
+    speak_message = fingerprint_client.speak_message  # type: ignore
+    speak_result = fingerprint_client.speak_result  # type: ignore
 
 
 DEFAULT_DEVICE = "/dev/ttyUSB0"
 DEFAULT_BAUDRATE = 57600
 DEFAULT_JSON_FILE = "fingerprint_results.json"
+
+
+def _local_result(error: str, voice_enabled: bool, **extra: Any) -> Dict[str, Any]:
+    """Return and speak a local sensor result consistently."""
+    result: Dict[str, Any] = {"ok": False, "error": error, **extra}
+    speak_message(str(error), enabled=voice_enabled)
+    return result
 
 
 def _quit_requested() -> bool:
@@ -109,8 +118,14 @@ def _display_result(result: Dict[str, Any], json_file: str) -> None:
     print("=" * 58)
 
 
-def _post_with_retries(url: str, payload: Dict[str, Any], retries: int, timeout: int = 6) -> Dict[str, Any]:
-    device_token = os.getenv("FINGERPRINT_DEVICE_TOKEN", "")
+def _post_with_retries(
+    url: str,
+    payload: Dict[str, Any],
+    retries: int,
+    timeout: int = 6,
+    voice_enabled: bool | None = None,
+) -> Dict[str, Any]:
+    device_token = os.getenv("SEHCS_DEVICE_TOKEN", "")
     headers = {"X-Fingerprint-Token": device_token} if device_token else {}
     attempt = 0
     while True:
@@ -121,11 +136,15 @@ def _post_with_retries(url: str, payload: Dict[str, Any], retries: int, timeout:
                 body = resp.json()
             except Exception:
                 body = {"status_code": resp.status_code, "text": resp.text}
-            return {"ok": resp.ok, "status_code": resp.status_code, "body": body}
+            result = {"ok": resp.ok, "status_code": resp.status_code, "body": body}
+            speak_result(result, enabled=voice_enabled)
+            return result
         except requests.RequestException as exc:
             print(f"Request failed (attempt {attempt}): {exc}")
             if attempt >= retries:
-                return {"ok": False, "error": str(exc)}
+                result = {"ok": False, "error": str(exc)}
+                speak_result(result, enabled=voice_enabled)
+                return result
             time.sleep(2)
 
 
@@ -143,24 +162,23 @@ def run_once_sensor_mode(
         from pyfingerprint.pyfingerprint import PyFingerprint  # type: ignore[reportMissingImports]
     except Exception as exc:  # pragma: no cover - runtime only on Pi
         print("pyfingerprint library is not available:", exc)
-        return {"ok": False, "error": "pyfingerprint not installed"}
+        return _local_result("pyfingerprint not installed", voice_enabled)
 
     try:
         f = PyFingerprint(device, baudrate, 0xFFFFFFFF, 0x00000000)
         if not f.verifyPassword():
             print("Fingerprint sensor password verification failed.")
-            return {"ok": False, "error": "sensor auth failed"}
+            return _local_result("Fingerprint sensor authentication failed.", voice_enabled)
     except Exception as exc:
         print("Failed to init sensor:", exc)
-        return {"ok": False, "error": str(exc)}
+        return _local_result(str(exc), voice_enabled)
 
     print("Waiting for finger...")
-    speak("Please place your finger on the sensor.", enabled=voice_enabled)
     try:
         # Wait for finger image
         while not f.readImage():
             if _quit_requested():
-                return {"ok": False, "quit": True, "error": "Stopped by user."}
+                return _local_result("Stopped by user.", voice_enabled, quit=True)
             time.sleep(0.2)
 
         # Convert to characteristics (buffer 1)
@@ -174,18 +192,20 @@ def run_once_sensor_mode(
             speak("Remove your finger, then place the same finger again.", enabled=voice_enabled)
             while f.readImage():
                 if _quit_requested():
-                    return {"ok": False, "quit": True, "error": "Stopped by user."}
+                    return _local_result("Stopped by user.", voice_enabled, quit=True)
                 time.sleep(0.2)
             while not f.readImage():
                 if _quit_requested():
-                    return {"ok": False, "quit": True, "error": "Stopped by user."}
+                    return _local_result("Stopped by user.", voice_enabled, quit=True)
                 time.sleep(0.2)
             f.convertImage(0x02)
 
             try:
                 f.createTemplate()
             except Exception as exc:
-                return {"ok": False, "error": f"Could not create sensor template from two scans: {exc}"}
+                return _local_result(
+                    f"Could not create sensor template from two scans: {exc}", voice_enabled
+                )
 
         # Ask the AS608 to identify this finger from its internal storage.
         position_number = -1
@@ -235,29 +255,29 @@ def run_once_sensor_mode(
                     "sensor_position": stored_position,
                 },
                 retries,
+                voice_enabled=voice_enabled,
             )
 
         if position_number < 0:
-            return {
-                "ok": False,
-                "error": "AS608 did not recognize this finger. Enroll it again or check the sensor memory.",
-                "sensor_position": position_number,
-                "accuracy": accuracy_score,
-            }
+            return _local_result(
+                "AS608 did not recognize this finger. Enroll it again or check the sensor memory.",
+                voice_enabled,
+                sensor_position=position_number,
+                accuracy=accuracy_score,
+            )
 
         if test_resident is not None and position_number != test_resident:
             print(
                 f"Rejected fingerprint: sensor position {position_number} "
                 f"does not belong to resident {test_resident}."
             )
-            speak("This fingerprint belongs to a different resident.", enabled=voice_enabled)
-            return {
-                "ok": False,
-                "error": "Recognized fingerprint belongs to a different sensor slot.",
-                "sensor_position": position_number,
-                "accuracy": accuracy_score,
-                "expected_position": test_resident,
-            }
+            return _local_result(
+                "Recognized fingerprint belongs to a different sensor slot.",
+                voice_enabled,
+                sensor_position=position_number,
+                accuracy=accuracy_score,
+                expected_position=test_resident,
+            )
 
         print("Sending payload to fingerprint check-in endpoint...")
         # Include the actual fingerprint template for lookups against the
@@ -276,14 +296,13 @@ def run_once_sensor_mode(
                 "accuracy": accuracy_score,
             },
             retries=retries,
+            device_token=os.getenv("SEHCS_DEVICE_TOKEN", ""),
+            voice_enabled=voice_enabled,
         )
-        body = result.get("body", {}) if isinstance(result, dict) else {}
-        message = body.get("message") if isinstance(body, dict) else None
-        speak(message or "Fingerprint check-in completed.", enabled=voice_enabled)
         return result
     except Exception as exc:
         print("Error during capture:", exc)
-        return {"ok": False, "error": str(exc)}
+        return _local_result(str(exc), voice_enabled)
 
 
 def run_loop(

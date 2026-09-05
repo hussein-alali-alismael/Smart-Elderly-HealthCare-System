@@ -3,7 +3,7 @@ import sys
 import unittest
 from unittest.mock import MagicMock, patch
 
-os.environ["FINGERPRINT_DEVICE_TOKEN"] = "test-device-token"
+os.environ["SEHCS_DEVICE_TOKEN"] = "test-device-token"
 os.environ["DISABLE_NOTIFICATION_WORKER"] = "1"
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -13,6 +13,9 @@ from fingerprint_agent import FingerprintMedicationAgent
 
 
 class FingerprintSecurityTests(unittest.TestCase):
+    def setUp(self):
+        os.environ["SEHCS_DEVICE_TOKEN"] = "test-device-token"
+
     def test_checkin_requires_device_token(self):
         client = flask_app.test_client()
 

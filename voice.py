@@ -4,7 +4,12 @@ from __future__ import annotations
 import os
 import platform
 import subprocess
+import logging
 from typing import Optional
+
+import requests
+
+logger = logging.getLogger(__name__)
 
 
 def voice_enabled(default: bool = False) -> bool:
@@ -28,6 +33,26 @@ def speak(text: str, *, enabled: Optional[bool] = None) -> bool:
         return False
 
     message = " ".join(str(text).split())[:500]
+    device_url = os.getenv("SEHCS_VOICE_DEVICE_URL", "").strip()
+    if device_url:
+        try:
+            response = requests.post(
+                device_url.rstrip("/") + "/speak",
+                json={"message": message},
+                headers={"X-Voice-Token": os.getenv("SEHCS_DEVICE_TOKEN", "")},
+                timeout=3,
+            )
+            if response.status_code != 202:
+                logger.warning(
+                    "Raspberry Pi voice service rejected speech with HTTP %s: %s",
+                    response.status_code,
+                    response.text[:200],
+                )
+            return response.status_code == 202
+        except requests.RequestException as exc:
+            logger.warning("Could not reach Raspberry Pi voice service at %s: %s", device_url, exc)
+            return False
+
     system = platform.system()
     try:
         if system == "Windows":
@@ -44,7 +69,7 @@ def speak(text: str, *, enabled: Optional[bool] = None) -> bool:
             command = next((name for name in ("espeak-ng", "espeak") if _command_exists(name)), None)
             if command is None:
                 return False
-            subprocess.Popen([command, "-v", os.getenv("SEHCS_TTS_VOICE", "en"), message])
+            subprocess.Popen([command, "-v", os.getenv("SEHCS_TTS_VOICE", "en+f3"), message])
         return True
     except (OSError, subprocess.SubprocessError):
         return False

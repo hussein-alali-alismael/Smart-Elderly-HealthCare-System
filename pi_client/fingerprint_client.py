@@ -21,8 +21,57 @@ from typing import Any, Dict
 
 import requests
 
+try:
+    from voice import enabled_from_environment, speak
+except ImportError:
+    enabled_from_environment = lambda: False
+    speak = lambda text, enabled=True: False
+
 DEFAULT_RETRY_SECONDS = 5
 DEFAULT_TIMEOUT = 6
+
+
+def speak_result(result: Dict[str, Any], enabled: bool | None = None) -> None:
+    """Speak the useful message from a fingerprint server result."""
+    if not isinstance(result, dict):
+        return
+
+    body = result.get("body")
+    message = None
+    if isinstance(body, dict):
+        message = body.get("message") or body.get("error") or body.get("text")
+    if not message:
+        message = result.get("error")
+    if not message:
+        message = "Fingerprint check-in completed." if result.get("ok") else "Fingerprint check-in failed."
+
+    speak_message(
+        str(message),
+        enabled=enabled_from_environment() if enabled is None else enabled,
+    )
+
+
+def speak_message(message: str, enabled: bool = True) -> None:
+    """Use the central Pi voice service, matching scheduler speech."""
+    if not enabled or not message:
+        return
+
+    voice_url = os.getenv("SEHCS_VOICE_DEVICE_URL", "http://127.0.0.1:5051").strip()
+    token = os.getenv("SEHCS_DEVICE_TOKEN", "")
+    try:
+        response = requests.post(
+            voice_url.rstrip("/") + "/speak",
+            json={"message": " ".join(str(message).split())[:500]},
+            headers={"X-Voice-Token": token},
+            timeout=3,
+        )
+        if response.status_code == 202:
+            return
+    except requests.RequestException:
+        pass
+
+    # Keep local speech as a fallback if the voice service is unavailable.
+    speak(str(message), enabled=True)
 
 
 def send_payload(
@@ -30,9 +79,10 @@ def send_payload(
     payload: Dict[str, Any],
     retries: int = 5,
     device_token: str | None = None,
+    voice_enabled: bool | None = None,
 ) -> Dict[str, Any]:
     url = server.rstrip("/") + "/api/fingerprint-checkin"
-    token = device_token or os.getenv("FINGERPRINT_DEVICE_TOKEN", "")
+    token = device_token or os.getenv("SEHCS_DEVICE_TOKEN", "")
     headers = {"X-Fingerprint-Token": token} if token else {}
     attempt = 0
     while True:
@@ -43,11 +93,15 @@ def send_payload(
                 body = resp.json()
             except Exception:
                 body = {"status_code": resp.status_code, "text": resp.text}
-            return {"ok": resp.ok, "status_code": resp.status_code, "body": body}
+            result = {"ok": resp.ok, "status_code": resp.status_code, "body": body}
+            speak_result(result, enabled=voice_enabled)
+            return result
         except requests.RequestException as exc:
             print(f"Request failed (attempt {attempt}): {exc}")
             if attempt >= retries:
-                return {"ok": False, "error": str(exc)}
+                result = {"ok": False, "error": str(exc)}
+                speak_result(result, enabled=voice_enabled)
+                return result
             time.sleep(DEFAULT_RETRY_SECONDS)
 
 
@@ -60,8 +114,8 @@ def main(argv=None):
     parser.add_argument("--retries", type=int, default=5)
     parser.add_argument(
         "--token",
-        default=os.getenv("FINGERPRINT_DEVICE_TOKEN", ""),
-        help="Shared token configured as FINGERPRINT_DEVICE_TOKEN",
+        default=os.getenv("SEHCS_DEVICE_TOKEN", ""),
+        help="Shared token configured as SEHCS_DEVICE_TOKEN",
     )
     args = parser.parse_args(argv)
 

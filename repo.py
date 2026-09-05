@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta
 
 import pymysql
 from flask import jsonify
+from werkzeug.security import check_password_hash, generate_password_hash
 
 db_connection = None
 _db_connections = threading.local()
@@ -109,6 +110,55 @@ def ensure_fingerprint_sensor_mapping():
     connection.commit()
 
 
+def ensure_user_password_column():
+    """Add password storage to older installations without changing existing data."""
+    connection = get_db_connection()
+    if connection is None:
+        return
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """SELECT COUNT(*) AS count FROM information_schema.COLUMNS
+               WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users'
+               AND COLUMN_NAME = 'password_hash'"""
+        )
+        column_count = cursor.fetchone()
+        if column_count is not None and column_count["count"] == 0:
+            cursor.execute(
+                "ALTER TABLE users ADD COLUMN password_hash VARCHAR(255) NULL AFTER email"
+            )
+    connection.commit()
+
+
+def ensure_fall_event_id_column():
+    """Add the fall-event idempotency key to older database installations."""
+    connection = get_db_connection()
+    if connection is None:
+        return
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """SELECT COUNT(*) AS count FROM information_schema.COLUMNS
+               WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'fall_incidents'
+               AND COLUMN_NAME = 'evidencePath'"""
+        )
+        evidence_column = cursor.fetchone()
+        if evidence_column is not None and evidence_column["count"] == 0:
+            cursor.execute(
+                "ALTER TABLE fall_incidents ADD COLUMN evidencePath VARCHAR(500) NULL"
+            )
+        cursor.execute(
+            """SELECT COUNT(*) AS count FROM information_schema.COLUMNS
+               WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'fall_incidents'
+               AND COLUMN_NAME = 'eventId'"""
+        )
+        column_count = cursor.fetchone()
+        if column_count is not None and column_count["count"] == 0:
+            cursor.execute("ALTER TABLE fall_incidents ADD COLUMN eventId VARCHAR(128) NULL")
+            cursor.execute(
+                "CREATE UNIQUE INDEX uq_fall_incidents_eventId ON fall_incidents (eventId)"
+            )
+    connection.commit()
+
+
 def get_user_by_open_id(open_id):
     """Return the account and all resident IDs associated with an OAuth identity."""
     if not open_id or not isinstance(open_id, str):
@@ -121,7 +171,7 @@ def get_user_by_open_id(open_id):
     with connection.cursor() as cursor:
         cursor.execute(
             """
-            SELECT id, openId, name, email, role
+            SELECT id, openId, name, email, password_hash, role
             FROM users
             WHERE openId = %s OR email = %s
             LIMIT 1
@@ -146,12 +196,15 @@ def get_user_by_open_id(open_id):
     return user
 
 
-def create_user(name, email):
-    """Create a local account using the schema's existing email/openId identity."""
+def create_user(name, email, password):
+    """Create a local account with a one-way password hash."""
     name = (name or "").strip()
     email = (email or "").strip().lower()
+    password = password or ""
     if not name or not email or "@" not in email:
         return jsonify({"error": "Name and a valid email are required."}), 400
+    if len(password) < 8:
+        return jsonify({"error": "Password must be at least 8 characters."}), 400
 
     connection = get_db_connection()
     if connection is None:
@@ -162,8 +215,8 @@ def create_user(name, email):
         if cursor.fetchone() is not None:
             return jsonify({"error": "An account with this email already exists."}), 409
         cursor.execute(
-            "INSERT INTO users (openId, name, email, role) VALUES (%s, %s, %s, 'user')",
-            (email, name, email),
+            "INSERT INTO users (openId, name, email, password_hash, role) VALUES (%s, %s, %s, %s, 'user')",
+            (email, name, email, generate_password_hash(password)),
         )
         user_id = cursor.lastrowid
     connection.commit()
@@ -177,6 +230,24 @@ def calculate_date_of_birth(age):
         return date.today().replace(year=date.today().year - age).isoformat()
     except ValueError:
         return None
+
+
+def validate_elderly_date_of_birth(date_of_birth):
+    """Validate that a resident is at least 50 years old today."""
+    if not isinstance(date_of_birth, str) or not date_of_birth.strip():
+        return False
+    try:
+        birth_date = datetime.strptime(date_of_birth.strip(), "%Y-%m-%d").date()
+    except ValueError:
+        return False
+
+    today = date.today()
+    try:
+        youngest_allowed_birth_date = today.replace(year=today.year - 50)
+    except ValueError:
+        # A Feb 29 birthday reaches the minimum age on Feb 28 in non-leap years.
+        youngest_allowed_birth_date = date(today.year - 50, 2, 28)
+    return birth_date <= youngest_allowed_birth_date
 
 def list_residents(user_id=None):
         connection = get_db_connection()
@@ -217,8 +288,8 @@ def create_patient(payload, user_id=None):
         if date_of_birth is None:
             date_of_birth = calculate_date_of_birth(age)
 
-        if not isinstance(date_of_birth, str):
-            return jsonify({"error": "Age must be an integer or dateOfBirth must be a string."}), 400
+        if not validate_elderly_date_of_birth(date_of_birth):
+            return jsonify({"error": "Resident must be at least 50 years old."}), 400
 
         connection = get_db_connection()
         if connection is None:
@@ -249,6 +320,16 @@ def create_patient(payload, user_id=None):
             "condition": condition,
             "status": "stable",
         }), 201
+
+
+def get_user_by_credentials(identity, password):
+    """Return a user only when the supplied password matches its stored hash."""
+    user = get_user_by_open_id(identity)
+    if user is None or not user.get("password_hash"):
+        return None
+    if not check_password_hash(user["password_hash"], password or ""):
+        return None
+    return user
 
 def alerts(user_id=None):
         connection = get_db_connection()
@@ -682,6 +763,8 @@ def update_resident(resident_id, payload, user_id):
     notes = str(payload.get("notes", "")).strip() or None
     if not name:
         return jsonify({"error": "Please provide a resident name."}), 400
+    if not validate_elderly_date_of_birth(date_of_birth):
+        return jsonify({"error": "Resident must be at least 50 years old."}), 400
     connection = _db_or_error()
     if connection is None:
         return jsonify({"error": "Database is not available."}), 503

@@ -42,7 +42,7 @@ The backend uses a session cookie for authentication. The login identity must be
 
 ### CSRF and cross-origin development
 
-Before any `POST`, `PUT`, `PATCH`, or `DELETE`, request `GET /api/auth/csrf`
+Before any `POST`, `PUT`, `PATCH`, or `DELETE`, request `GET /api/csrf-token`
 with credentials. The response sets a `csrf_token` cookie and returns the same
 value as `csrfToken`. Send that value in the `X-CSRFToken` header and include
 credentials on every request. The backend allows only origins listed in

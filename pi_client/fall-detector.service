@@ -1,0 +1,16 @@
+[Unit]
+Description=SEHCS Raspberry Pi YOLO pose fall detector and MJPEG stream
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=raspi
+WorkingDirectory=/home/raspi/Desktop/SEHCS
+EnvironmentFile=-/home/raspi/Desktop/SEHCS/pi.env
+ExecStart=/home/raspi/Desktop/SEHCS/bin/python /home/raspi/Desktop/SEHCS/fall_detector.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -16,15 +16,12 @@ from __future__ import annotations
 import json
 import os
 import threading
-import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
-from flask import jsonify
 from langchain_core.chat_history import InMemoryChatMessageHistory
-from langchain_core.messages import HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -49,6 +46,11 @@ def _speak_async(text: str) -> None:
             pass
 
     threading.Thread(target=speak_safely, daemon=True).start()
+
+
+def _speak_reminder_async(message: str) -> None:
+    """Speak only the human-readable medication reminder message."""
+    _speak_async(str(message))
 
 
 @dataclass
@@ -154,6 +156,8 @@ class MedicationSchedulerAgent:
     def __init__(self, announcement_window_minutes: int = ANNOUNCEMENT_WINDOW_MINUTES):
         self.announcement_window_minutes = announcement_window_minutes
         self._stop_event = threading.Event()
+        self._spoken_reminder_keys: set[tuple[int, int, str]] = set()
+        self._last_notification_was_duplicate = False
 
     def node_1_load_schedule_time(self) -> List[ScheduleRecord]:
         """Load schedule times from the database."""
@@ -303,19 +307,24 @@ class MedicationSchedulerAgent:
             )
             return cursor.fetchone() is not None
 
+    @staticmethod
+    def _reminder_message(schedule: ScheduleRecord, planned_datetime: datetime) -> str:
+        spoken_time = planned_datetime.strftime("%I:%M %p").lstrip("0")
+        return (
+            f"Reminder for {schedule.resident_name}: it is time to take "
+            f"{schedule.medication_name} at {spoken_time}."
+        )
+
     def node_3_build_notification_in_table(self, schedule: ScheduleRecord, planned_datetime: datetime, now: Optional[datetime] = None) -> Optional[NotificationRecord]:
         """Insert a notification row unless it already exists."""
+        self._last_notification_was_duplicate = False
         connection = get_db_connection()
         if connection is None:
             return None
 
         now = now or datetime.now()
         notification_type = "medication_reminder"
-        spoken_time = planned_datetime.strftime("%I:%M %p").lstrip("0")
-        message = (
-            f"Reminder for {schedule.resident_name}: it is time to take "
-            f"{schedule.medication_name} at {spoken_time}."
-        )
+        message = self._reminder_message(schedule, planned_datetime)
 
         if self._notification_exists(
             connection,
@@ -324,6 +333,7 @@ class MedicationSchedulerAgent:
             message,
             notification_date=now.date().isoformat(),
         ):
+            self._last_notification_was_duplicate = True
             return None
 
         record = NotificationRecord(
@@ -378,11 +388,22 @@ class MedicationSchedulerAgent:
 
             notification = self.node_3_build_notification_in_table(schedule, planned_datetime, now=now)
             if notification is None:
+                reminder_key = (
+                    schedule.schedule_time_id,
+                    schedule.resident_id,
+                    now.date().isoformat(),
+                )
+                if self._last_notification_was_duplicate and reminder_key not in self._spoken_reminder_keys:
+                    _speak_reminder_async(self._reminder_message(schedule, planned_datetime))
+                    self._spoken_reminder_keys.add(reminder_key)
                 continue
 
             payload = self.node_4_make_text_json_for_webdash(schedule, planned_datetime, notification, now=now)
             payloads.append(payload)
-            _speak_async(notification.message)
+            _speak_reminder_async(notification.message)
+            self._spoken_reminder_keys.add(
+                (schedule.schedule_time_id, schedule.resident_id, now.date().isoformat())
+            )
 
         return payloads
 

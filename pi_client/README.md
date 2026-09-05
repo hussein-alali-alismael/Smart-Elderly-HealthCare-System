@@ -42,12 +42,69 @@ Install the optional dependency for the sensor:
 pip install pyfingerprint
 ```
 
-Voice prompts and results are enabled by default on the Pi. Install a speech
-engine and speaker support:
+Voice prompts and results are enabled by default on the Pi. The Pi is the
+recommended single sound source for schedule, fingerprint, and fall messages.
+Install a speech engine and speaker support:
 
 ```bash
 sudo apt install -y espeak-ng alsa-utils
 ```
+
+Test the speaker before starting the service:
+
+```bash
+espeak-ng "SEHCS voice test"
+```
+
+If `aplay` reports `audio open error: Unknown error 524`, the default ALSA
+device is unavailable. List the actual devices:
+
+```bash
+aplay -l
+aplay -L
+```
+
+Then test a listed device, for example:
+
+```bash
+aplay -D plughw:0,0 /tmp/test.wav
+```
+
+If that works, add this to `~/Desktop/SEHCS/.env` and restart the service:
+
+```env
+SEHCS_AUDIO_DEVICE=plughw:0,0
+```
+
+Use the device name shown by your own `aplay -l`; `0,0` is only an example.
+For a USB speaker it may be `plughw:1,0`.
+
+For a Bluetooth speaker, connect it and check the PipeWire audio sinks:
+
+```bash
+bluetoothctl
+power on
+connect XX:XX:XX:XX:XX:XX
+quit
+wpctl status
+```
+
+Test the connected speaker with:
+
+```bash
+pw-play /tmp/test.wav
+```
+
+If that works, use these settings in `.env`:
+
+```env
+SEHCS_AUDIO_PLAYER=pw-play
+SEHCS_AUDIO_DEVICE=
+```
+
+Restart `sehcs-voice.service` after changing `.env`. Do not set
+`SEHCS_AUDIO_DEVICE=plughw:Headphones,0` for Bluetooth; that is the wired
+headphone output.
 
 Run with voice:
 
@@ -57,17 +114,107 @@ python fingerprint_sensor_bridge.py --server http://<FLASK_SERVER_IP>:5000 --dev
 
 Disable speech when needed with `--no-voice`. The bridge speaks short messages
 only; the complete server response is still displayed and saved in the JSON
-history file. The Pi is the recommended voice device, so Flask server speech is
-disabled by default to prevent duplicate announcements.
+history file.
 
-To enable schedule-reminder speech on the computer running Flask, set
-`SEHCS_SERVER_VOICE_ENABLED=true` in its environment. On Windows, speech uses
-PowerShell's built-in speech engine; on Linux it uses `espeak-ng` or `espeak`.
-Fingerprint check-in messages remain spoken by the Pi, avoiding duplicate audio.
+To route schedule and fall announcements from Flask to the same Pi speaker,
+start the voice service in another terminal:
+
+```bash
+export SEHCS_VOICE_DEVICE_TOKEN="replace-with-the-same-voice-token"
+python pi_client/voice_server.py
+```
+
+To start it automatically at every boot and load `.env` automatically, install
+the included systemd service. First convert a `.env` copied from Windows to
+Linux line endings:
+
+```bash
+sudo apt install -y dos2unix
+dos2unix ~/Desktop/SEHCS/.env
+sudo cp ~/Desktop/SEHCS/pi_client/sehcs-voice.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now sehcs-voice.service
+sudo systemctl status sehcs-voice.service
+```
+
+View service errors with:
+
+```bash
+journalctl -u sehcs-voice.service -f
+```
+
+The service reads `/home/raspi/Desktop/SEHCS/.env` itself, so you no longer
+need to run `source .env` manually.
+
+On the Flask computer, configure:
+
+```env
+SEHCS_SERVER_VOICE_ENABLED=true
+SEHCS_VOICE_DEVICE_URL=http://<RASPBERRY_PI_IP>:5051
+SEHCS_VOICE_DEVICE_TOKEN=replace-with-the-same-voice-token
+```
+
+When `SEHCS_VOICE_DEVICE_URL` is set, Flask sends speech to the Pi and does
+not use the laptop speaker. Fingerprint messages continue to be spoken locally
+by the Pi bridge.
+
+### Important root-level Pi layout
+
+If your Pi runs the scripts from `~/Desktop/SEHCS` instead of
+`~/Desktop/SEHCS/pi_client`, copy the Pi voice helper to the project root:
+
+```bash
+cp ~/Desktop/SEHCS/pi_client/voice.py ~/Desktop/SEHCS/voice.py
+```
+
+The root `voice.py` must be the Pi helper, not the Flask computer's
+`voice.py`. The root `voice_server.py`, fingerprint bridge, and systemd service
+all import this root helper. Confirm Piper is selected:
+
+```bash
+grep -E '^SEHCS_TTS_ENGINE=|^SEHCS_PIPER_MODEL=|^SEHCS_AUDIO_PLAYER=' ~/Desktop/SEHCS/.env
+```
+
+Before running the fingerprint bridge manually, load `.env` in that shell:
+
+```bash
+cd ~/Desktop/SEHCS
+source .env
+python fingerprint_sensor_bridge.py --server "$FLASK_SERVER_URL" --device "$FINGERPRINT_DEVICE"
+```
+
+Confirm the root helper is the Piper-capable Pi version:
+
+```bash
+grep -n 'SEHCS_TTS_ENGINE\|_speak_with_piper\|Path(sys.executable)' ~/Desktop/SEHCS/voice.py
+```
+
+If those lines are missing, replace the root helper:
+
+```bash
+cp ~/Desktop/SEHCS/pi_client/voice.py ~/Desktop/SEHCS/voice.py
+```
+
+If your Pi has no `pi_client` directory, copy `pi_client/voice.py` from the
+Windows project to `/home/raspi/Desktop/SEHCS/voice.py` with `scp`, then run
+the `grep` check again. The bridge must be started from a shell where
+`SEHCS_TTS_ENGINE=piper` and `SEHCS_PIPER_MODEL` are loaded.
 
 Set `SEHCS_TTS_VOICE=ar` for Arabic on a Pi if the Arabic voice is installed;
 use `en` for English. Available voices depend on the operating system and
 installed speech packages.
+
+For a more natural accent than eSpeak, Piper can be used locally on the Pi.
+Install Piper and download a compatible voice model, then configure:
+
+```env
+SEHCS_TTS_ENGINE=piper
+SEHCS_PIPER_MODEL=/home/raspi/models/en_US-lessac-medium.onnx
+SEHCS_AUDIO_PLAYER=aplay
+```
+
+Piper is the default engine for the Pi bridge. If you deliberately choose
+`SEHCS_TTS_ENGINE=espeak`, the fallback voice is the female `en+f3` voice.
 
 The bridge uses the AS608's internal fingerprint search for normal check-in and sends the captured `fingerprintTemplate` to Flask. Configure the same `FINGERPRINT_DEVICE_TOKEN` on the Pi and Flask server. Flask performs the resident match from the captured template; a sensor position or resident id alone is not accepted.
 

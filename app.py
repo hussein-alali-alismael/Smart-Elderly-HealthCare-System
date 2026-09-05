@@ -8,9 +8,10 @@ import time
 from dataclasses import asdict
 from datetime import datetime
 from typing import cast
+from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import load_dotenv
-from flask import Flask, current_app, jsonify, redirect, render_template, request, send_from_directory, session
+from flask import Flask, current_app, jsonify, request, send_from_directory, session
 from flask_wtf.csrf import CSRFProtect, generate_csrf
 
 from repo import (
@@ -26,6 +27,9 @@ from repo import (
     add_resident_relationship as repo_add_resident_relationship,
     get_db_connection,
     get_user_by_open_id,
+    get_user_by_credentials,
+    ensure_user_password_column,
+    ensure_fall_event_id_column,
     ensure_medication_ownership,
     ensure_fingerprint_sensor_mapping,
     list_medication_intakes as repo_list_medication_intakes,
@@ -71,9 +75,9 @@ from fingerprint_agent import FingerprintMedicationAgent
 
 # Clone-safe config: copy .env.example to .env on a fresh machine before running the app.
 # This keeps the project runnable without a pre-existing local secret file.
-load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"), override=True)
 if not os.path.exists(os.path.join(os.path.dirname(__file__), ".env")):
-    load_dotenv(os.path.join(os.path.dirname(__file__), ".env.example"))
+    load_dotenv(os.path.join(os.path.dirname(__file__), ".env.example"), override=True)
 
 # Default network binding so `flask run` and direct execution are LAN-reachable by default.
 os.environ.setdefault("FLASK_RUN_HOST", "0.0.0.0")
@@ -91,6 +95,7 @@ _notification_worker_state = {
 }
 _rate_limit_lock = threading.Lock()
 _rate_limit_buckets = {}
+_frontend_dist_dir = os.path.join(os.path.dirname(__file__), "frontend", "dist")
 
 
 def _allow_request(bucket, limit, window_seconds):
@@ -120,11 +125,16 @@ def _frontend_origins():
 
 
 def _has_valid_fingerprint_device_token():
-    device_token = os.getenv("FINGERPRINT_DEVICE_TOKEN", "").strip()
+    device_token = _device_token()
     if not device_token or device_token.startswith("replace-with-"):
         return False
     supplied_token = request.headers.get("X-Fingerprint-Token", "")
     return bool(supplied_token) and hmac.compare_digest(supplied_token, device_token)
+
+
+def _device_token() -> str:
+    """Return the single shared token used by the Raspberry Pi device."""
+    return os.getenv("SEHCS_DEVICE_TOKEN", "").strip()
 
 
 def _notification_worker_loop(app_instance):
@@ -208,9 +218,21 @@ def _admin_required(view):
 
     return wrapped
 
+
+def _serve_react_app():
+    """Return the Vite-built React shell for every non-API browser route."""
+    index_file = os.path.join(_frontend_dist_dir, "index.html")
+    if not os.path.isfile(index_file):
+        return jsonify({
+            "error": "React frontend is not built.",
+            "message": "Run npm install and npm run build in the frontend directory.",
+        }), 503
+    return send_from_directory(_frontend_dist_dir, "index.html")
+
+
 def create_app():
     global app
-    app = Flask(__name__)
+    app = Flask(__name__, static_folder=None)
     app.config["JSON_SORT_KEYS"] = False
     configured_secret = os.getenv("FLASK_SECRET_KEY", "").strip()
     if not configured_secret or configured_secret.startswith("replace-with-"):
@@ -255,8 +277,7 @@ def create_app():
         if request.path.startswith("/api/residents/") and request.path.endswith("/fingerprint") and _has_valid_fingerprint_device_token():
             return None
         if not request.path.startswith("/api/") or request.path in {
-            "/api/fingerprint-checkin", "/api/fall-alerts",
-            "/api/auth/login", "/api/auth/signup", "/api/auth/logout", "/api/csrf-token"
+            "/api/fingerprint-checkin", "/api/fall-alerts", "/api/csrf-token"
         }:
             return None
 
@@ -266,10 +287,6 @@ def create_app():
             if origin.rstrip("/") not in allowed:
                 return jsonify({"error": "Cross-origin request rejected."}), 403
 
-        same_origin = (origin is None) or (origin.rstrip("/") == request.host_url.rstrip("/"))
-        if same_origin and session.get("user_id") is not None:
-            return None
-
         supplied_token = request.headers.get("X-CSRFToken", "")
         session_csrf_token = session.get("csrf_token")
         if not supplied_token or not session_csrf_token or not hmac.compare_digest(supplied_token, session_csrf_token):
@@ -278,45 +295,41 @@ def create_app():
     get_db_connection()
     ensure_medication_ownership()
     ensure_fingerprint_sensor_mapping()
+    ensure_user_password_column()
+    ensure_fall_event_id_column()
 
     @app.route("/")
     def index():
-        if "user_id" not in session:
-            return redirect("/login")
-        return render_template("index.html")
+        return _serve_react_app()
 
     @app.route("/login")
     def login_page():
-        # Login is rendered by the React app. The API still decides whether
-        # the submitted identity is valid and sets the Flask session cookie.
-        return render_template("login.html", csrf_token=generate_csrf())
+        return _serve_react_app()
 
     @app.route("/signup")
     def signup_page():
-        return render_template("signup.html", csrf_token=generate_csrf())
+        return _serve_react_app()
 
     @app.route("/assets/<path:filename>")
     def react_asset(filename):
-        """Serve Vite build assets while keeping them outside the templates folder."""
-        static_dir = os.path.join(os.path.dirname(__file__), "static")
-        return send_from_directory(static_dir, filename)
+        """Serve assets generated by the React/Vite build."""
+        return send_from_directory(os.path.join(_frontend_dist_dir, "assets"), filename)
 
-    @app.route("/<page>.html")
-    def frontend_page(page):
-        """Serve individual dashboard pages with authentication."""
-        if "user_id" not in session:
-            return redirect("/login")
-        allowed_pages = {"index", "live", "medications", "notifications", "patient_details"}
-        if page not in allowed_pages:
-            return jsonify({"error": "Page not found."}), 404
-        return render_template(f"{page}.html", csrf_token=generate_csrf())
+    @app.route("/logo.svg")
+    def react_logo():
+        return send_from_directory(os.path.join(_frontend_dist_dir), "logo.svg")
 
     @app.route("/<path:frontend_path>")
     def react_frontend_route(frontend_path):
-        """Serve the React shell for client-side routes such as /dashboard."""
+        """Serve the React shell for client-side routes and static files."""
         if frontend_path.startswith("api/"):
             return jsonify({"error": "API route not found."}), 404
-        return render_template("index.html")
+        if frontend_path.startswith("static/"):
+            return jsonify({"error": "Not found."}), 404
+        requested_file = os.path.join(_frontend_dist_dir, frontend_path)
+        if os.path.isfile(requested_file):
+            return send_from_directory(_frontend_dist_dir, frontend_path)
+        return _serve_react_app()
 
     @app.route("/health", methods=["GET"])
     def health():
@@ -336,19 +349,17 @@ def create_app():
         return jsonify({"csrf_token": token})
 
     @app.route("/api/auth/login", methods=["POST"])
-    @csrf.exempt
     def login():
         if not _allow_request(_client_bucket("login"), 5, 300):
             return jsonify({"error": "Too many login attempts. Try again later."}), 429
         payload = request.get_json(silent=True) or {}
-        if os.getenv("AUTH_ALLOW_LEGACY_IDENTITY", "0").lower() not in {"1", "true", "yes", "on"}:
-            return jsonify({
-                "error": "Verified OAuth/OIDC authentication is required; legacy identity login is disabled."
-            }), 503
         open_id = payload.get("openId") or payload.get("open_id")
-        user = get_user_by_open_id(open_id)
+        password = payload.get("password")
+        if not isinstance(password, str) or not password:
+            return jsonify({"error": "Email and password are required."}), 400
+        user = get_user_by_credentials(open_id, password)
         if user is None:
-            return jsonify({"error": "Invalid user identity."}), 401
+            return jsonify({"error": "Invalid email or password."}), 401
 
         session.clear()
         session["user_id"] = user["id"]
@@ -367,12 +378,11 @@ def create_app():
         })
 
     @app.route("/api/auth/signup", methods=["POST"])
-    @csrf.exempt
     def signup():
         if not _allow_request(_client_bucket("signup"), 3, 900):
             return jsonify({"error": "Too many signup attempts. Try again later."}), 429
         payload = request.get_json(silent=True) or {}
-        result = repo_create_user(payload.get("name"), payload.get("email"))
+        result = repo_create_user(payload.get("name"), payload.get("email"), payload.get("password"))
         if isinstance(result, tuple):
             response, status = result
             if status != 201:
@@ -400,35 +410,32 @@ def create_app():
         })
 
     @app.route("/api/auth/logout", methods=["POST"])
-    @csrf.exempt
     def logout():
         session.clear()
         return jsonify({"status": "logged_out"})
 
     @app.route("/api/residents", methods=["GET"])
+    @app.route("/api/patients", methods=["GET"])
     @_login_required
     def list_residents_endpoint():
         return list_residents(session["user_id"])
 
-    @app.route("/api/patients", methods=["GET"])
-    @_login_required
-    def list_patients():
-        return list_residents(session["user_id"])
-
+    @app.route("/api/residents", methods=["POST"])
     @app.route("/api/patients", methods=["POST"])
     @_login_required
-    def patient_endpoint():
+    def create_resident():
         payload = request.get_json(silent=True) or {}
         return repo_create_patient(payload, user_id=session["user_id"])
 
-    @app.route("/api/patients/<int:patient_id>", methods=["GET", "PATCH", "PUT", "DELETE"])
+    @app.route("/api/residents/<int:resident_id>", methods=["GET", "PATCH", "PUT", "DELETE"])
+    @app.route("/api/patients/<int:resident_id>", methods=["GET", "PATCH", "PUT", "DELETE"])
     @_login_required
-    def patient_detail(patient_id):
+    def resident_detail(resident_id):
         if request.method == "GET":
-            return repo_get_resident(patient_id, session["user_id"])
+            return repo_get_resident(resident_id, session["user_id"])
         if request.method == "DELETE":
-            return repo_delete_resident(patient_id, session["user_id"])
-        return repo_update_resident(patient_id, request.get_json(silent=True) or {}, session["user_id"])
+            return repo_delete_resident(resident_id, session["user_id"])
+        return repo_update_resident(resident_id, request.get_json(silent=True) or {}, session["user_id"])
         
     @app.route("/api/alerts")
     @_login_required
@@ -482,20 +489,6 @@ def create_app():
     def update_medication(medication_id):
         payload = request.get_json(silent=True) or {}
         return repo_update_medication(medication_id, payload, session["user_id"])
-
-    @app.route("/api/residents/<int:resident_id>", methods=["GET", "PATCH", "PUT", "DELETE"])
-    @_login_required
-    def resident_crud(resident_id):
-        if request.method == "GET":
-            return repo_get_resident(resident_id, session["user_id"])
-        if request.method == "DELETE":
-            return repo_delete_resident(resident_id, session["user_id"])
-        return repo_update_resident(resident_id, request.get_json(silent=True) or {}, session["user_id"])
-
-    @app.route("/api/residents", methods=["POST"])
-    @_login_required
-    def create_resident():
-        return repo_create_patient(request.get_json(silent=True) or {}, user_id=session["user_id"])
 
     @app.route("/api/medications/<int:medication_id>", methods=["GET", "DELETE"])
     @_login_required
@@ -623,6 +616,24 @@ def create_app():
     def fall_incidents():
         return repo_list_fall_incidents(session["user_id"], session.get("role") == "admin")
 
+    @app.route("/api/camera-config", methods=["GET"])
+    @_login_required
+    def camera_config():
+        """Return the configured Pi stream and status URLs to the dashboard."""
+        stream_url = os.getenv("FALL_STREAM_URL", "").strip()
+        if not stream_url:
+            return jsonify({"stream_url": "", "status_url": ""})
+
+        stream_parts = urlsplit(stream_url)
+        status_url = urlunsplit((
+            stream_parts.scheme,
+            stream_parts.netloc,
+            "/status",
+            "",
+            "",
+        ))
+        return jsonify({"stream_url": stream_url, "status_url": status_url})
+
     @app.route("/api/fall-incidents/<int:incident_id>", methods=["GET", "PATCH", "PUT"])
     @_login_required
     def fall_incident_detail(incident_id):
@@ -643,7 +654,7 @@ def create_app():
         Expected JSON body: any of the formats supported by `FingerprintMedicationAgent.process_fingerprint`,
         for example: { "fingerprint_id": 7 } or { "fingerprintTemplate": "...base64..." }
         """
-        device_token = os.getenv("FINGERPRINT_DEVICE_TOKEN", "").strip()
+        device_token = _device_token()
         supplied_token = request.headers.get("X-Fingerprint-Token", "")
         if not device_token or device_token.startswith("replace-with-"):
             return jsonify({"error": "Fingerprint device authentication is not configured."}), 503
@@ -696,7 +707,7 @@ def create_app():
         method dispatches live webhooks and would post back to this endpoint.
         The HTTP receiver only parses, validates, and stores the event.
         """
-        device_token = os.getenv("FALL_ALERT_DEVICE_TOKEN", "").strip()
+        device_token = _device_token()
         supplied_token = request.headers.get("X-Fall-Alert-Token", "")
         if not device_token or device_token.startswith("replace-with-"):
             return jsonify({"error": "Fall-alert device authentication is not configured."}), 503
@@ -717,6 +728,8 @@ def create_app():
             return jsonify({"status": "rejected", "reason": "invalid_payload"}), 400
         if not pipeline.node_2_verify_criticality(event):
             db_synced = pipeline.node_3_push_emergency_to_db(event, create_notification=False)
+            if event.is_duplicate:
+                return jsonify({"status": "duplicate", "event_details": asdict(event)}), 200
             return jsonify({
                 "status": "logged",
                 "db_synced": db_synced,
@@ -724,6 +737,8 @@ def create_app():
             }), 201
         if not pipeline.node_3_push_emergency_to_db(event):
             return jsonify({"status": "failed", "reason": "database_unavailable"}), 503
+        if event.is_duplicate:
+            return jsonify({"status": "duplicate", "event_details": asdict(event)}), 200
         audio_alerted = pipeline.node_5_trigger_audio_alarm(event)
 
         return jsonify({
@@ -747,7 +762,6 @@ def create_app():
             return jsonify({"routes": routes})
 
     @app.route("/api/residents/<int:resident_id>/fingerprint", methods=["POST"])
-    @csrf.exempt
     def enroll_resident_fingerprint(resident_id):
         """Enroll a base64-encoded fingerprint template for a resident.
 

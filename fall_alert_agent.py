@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-import json
 import os
+import hashlib
+import json
+import math
 import requests
+import threading
 from dataclasses import dataclass, asdict
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 from dotenv import load_dotenv
 from repo import get_db_connection
@@ -24,6 +27,18 @@ DEFAULT_DEVICE_ID = os.getenv("FALL_ALERT_DEVICE_ID") or None
 DEFAULT_LOCATION = os.getenv("FALL_ALERT_LOCATION") or None
 
 
+def _speak_async(text: str) -> None:
+    """Start model-result speech without blocking fall-event processing."""
+    def speak_safely() -> None:
+        try:
+            speak(text, enabled=server_voice_enabled())
+        except Exception:
+            # Speech must never prevent the event from being stored or alerted.
+            pass
+
+    threading.Thread(target=speak_safely, daemon=True).start()
+
+
 @dataclass
 class FallEventRecord:
     resident_id: Optional[int]
@@ -35,9 +50,17 @@ class FallEventRecord:
     evidence_path: Optional[str] = None
     incident_id: Optional[int] = None
     is_resolved: int = 0
+    event_id: Optional[str] = None
+    is_duplicate: bool = False
 
 
 class FallDetectionPipeline:
+
+    @staticmethod
+    def _is_fall_level(value: object) -> bool:
+        return str(value or "").strip().upper() in {
+            "FALL", "FALLING", "FALLEN", "CRITICAL_FALL", "FALL_DETECTED",
+        }
 
     def __init__(self, backend_url: str = BACKEND_API_URL):
         self.backend_url = backend_url
@@ -54,28 +77,58 @@ class FallDetectionPipeline:
             except ValueError:
                 resident_id = None
 
-        confidence_value = payload.get("detection_confidence") or payload.get("confidence")
+        confidence_value = payload.get("detection_confidence")
+        if confidence_value is None:
+            confidence_value = payload.get("confidence")
         confidence: Optional[float] = None
         if isinstance(confidence_value, (int, float, str)) and confidence_value != "":
             try:
-                confidence = float(confidence_value)
+                parsed_confidence = float(confidence_value)
+                if math.isfinite(parsed_confidence):
+                    confidence = max(0.0, min(1.0, parsed_confidence))
             except ValueError:
                 confidence = None
 
-        return FallEventRecord(
+        gravity_value = payload.get("gravity_level") or payload.get("gravityLevel")
+        if gravity_value is None:
+            fall_value = payload.get("fall", payload.get("is_fall", False))
+            status = str(payload.get("status") or "").strip().upper()
+            gravity_value = "FALL" if fall_value is True or status in {"FALL", "FALLING", "FALL_DETECTED"} else "NO_FALL"
+        gravity_level = "FALL" if self._is_fall_level(gravity_value) else str(gravity_value).strip().upper()
+
+        event = FallEventRecord(
             resident_id=resident_id,
-            gravity_level=str(payload.get("gravity_level") or "FALL"),
+            gravity_level=gravity_level or "FALL",
             detected_at=str(payload.get("detected_at") or payload.get("timestamp") or datetime.now().isoformat(timespec="seconds")),
             device_id=str(payload.get("device_id") or payload.get("deviceId") or DEFAULT_DEVICE_ID or "") or None,
             location=str(payload.get("location") or DEFAULT_LOCATION or "") or None,
             detection_confidence=confidence,
             evidence_path=str(payload.get("evidence_path") or payload.get("evidencePath") or "") or None,
+            event_id=str(payload.get("event_id") or payload.get("eventId") or payload.get("idempotency_key") or payload.get("idempotencyKey") or "") or None,
         )
+        if event.event_id is None:
+            event.event_id = hashlib.sha256(json.dumps({
+                "resident_id": event.resident_id,
+                "gravity_level": event.gravity_level,
+                "detected_at": event.detected_at,
+                "device_id": event.device_id,
+                "location": event.location,
+                "detection_confidence": event.detection_confidence,
+                "evidence_path": event.evidence_path,
+            }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        resident = f" for resident {event.resident_id}" if event.resident_id is not None else ""
+        if self._is_fall_level(event.gravity_level):
+            message = f"Emergency! Fall detected{resident}. Please provide assistance immediately."
+        else:
+            message = f"Fall detection update{resident}: no fall detected."
+        # Non-critical model updates may be spoken immediately. Confirmed
+        # falls are announced once by node 5 after they are persisted.
+        if not self._is_fall_level(event.gravity_level):
+            _speak_async(message)
+        return event
 
     def node_2_verify_criticality(self, event: FallEventRecord) -> bool:
-        if event.gravity_level.upper() == "FALL":
-            return True
-        return False
+        return self._is_fall_level(event.gravity_level)
 
     def node_3_push_emergency_to_db(
         self,
@@ -94,12 +147,12 @@ class FallDetectionPipeline:
                     """
                     INSERT INTO fall_incidents
                         (residentId, deviceId, location, detectionConfidence,
-                         detectedAt, status, evidencePath)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        detectedAt, status, evidencePath, eventId)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (event.resident_id, event.device_id, event.location,
                      event.detection_confidence, event.detected_at, "detected",
-                     event.evidence_path)
+                     event.evidence_path, event.event_id)
                 )
                 event.incident_id = cursor.lastrowid
 
@@ -115,7 +168,11 @@ class FallDetectionPipeline:
                     )
             connection.commit()
             return True
-        except Exception:
+        except Exception as exc:
+            if getattr(exc, "args", [None])[0] == 1062:
+                event.is_duplicate = True
+                connection.rollback()
+                return True
             return False
 
     def node_4_dispatch_live_webhook(self, event: FallEventRecord) -> bool:

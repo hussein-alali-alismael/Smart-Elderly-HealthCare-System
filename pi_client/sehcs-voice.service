@@ -1,0 +1,18 @@
+[Unit]
+Description=SEHCS Raspberry Pi Voice Service
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=raspi
+WorkingDirectory=/home/raspi/Desktop/SEHCS
+EnvironmentFile=/home/raspi/Desktop/SEHCS/.env
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=PATH=/home/raspi/Desktop/SEHCS/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/raspi/Desktop/SEHCS/bin/python /home/raspi/Desktop/SEHCS/voice_server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

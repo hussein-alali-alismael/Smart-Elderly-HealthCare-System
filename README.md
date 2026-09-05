@@ -31,8 +31,8 @@ The Flask server is the only component that talks directly to the database. The 
 | `repo.py` | Database connection and database-backed repository functions |
 | `ai_agent.py` | Medication reminder worker and optional Gemini assistant |
 | `fingerprint_agent.py` | Fingerprint identification and medication-intake workflow |
-| `templates/index.html` | Current reference web dashboard |
-| `static/` | Static frontend assets |
+| `frontend/` | React/Vite browser application |
+| `frontend/dist/` | Production build served by Flask |
 | `pi_client/` | Raspberry Pi test client, AS608 bridge, and systemd services |
 | `..\elderly_healthcare_v3.sql` | Canonical MariaDB/MySQL schema and sample data |
 | `API_DOCUMENTATION.md` | Complete frontend API contract |
@@ -82,7 +82,35 @@ XAMPP commonly uses:
 
 Use the actual password configured in your XAMPP installation. Never commit it.
 
-## 2. Configure and run Flask
+## 2. Configure and run the React frontend
+
+The browser UI is React-only. The old Jinja templates and legacy static files
+are no longer served by Flask.
+
+From PowerShell, start the Vite development server in a separate terminal:
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+Open `http://127.0.0.1:5173`. Vite proxies `/api` requests to Flask on port
+5000, so browser cookies and API calls continue to use the Flask session.
+
+For a production-style single-server run, build React first:
+
+```powershell
+cd frontend
+npm install
+npm run build
+```
+
+Then start Flask as described below and open `http://127.0.0.1:5000`.
+Flask serves `frontend/dist` for `/`, `/login`, `/signup`, and React Router
+deep links, while `/api/*` remains exclusively JSON.
+
+## 3. Configure and run Flask
 
 Create a local `.env` file by copying `.env.example`, or use the more focused template `config/xampp.env.example`. Fill in the database values.
 
@@ -127,7 +155,7 @@ Open these URLs or call them from a browser/API client:
 
 If a database endpoint returns `503`, check that XAMPP MySQL is running and that `DB_PASSWORD` matches the XAMPP account.
 
-## 3. Connect Raspberry Pi to Flask
+## 4. Connect Raspberry Pi to Flask
 
 The Pi communicates with Flask using HTTP JSON. Both devices must be on the same Wi-Fi/Ethernet network, or the Windows laptop must be reachable through a configured hotspot.
 
@@ -147,7 +175,7 @@ Pi:             192.168.1.40
 
 On the Pi:
 
-1. Copy `pi_client/` to `/home/pi/SEHCS_WEB/pi_client`.
+1. Copy `pi_client/` to `/home/raspi/Desktop/SEHCS/pi_client`.
 2. Create a virtual environment.
 3. Install `requests`.
 4. Install `pyfingerprint` when using the AS608 hardware.
@@ -181,7 +209,7 @@ python fingerprint_sensor_bridge.py --server http://<WINDOWS_LAPTOP_IP>:5000 --d
 
 The bridge sends the captured fingerprint template and the sensor result as `fingerprintTemplate` plus metadata. Flask requires the `FINGERPRINT_DEVICE_TOKEN` header and matches the captured template against the resident template before checking today’s active medication schedules and recording a `taken` intake. A sensor position or resident ID alone is rejected.
 
-## 4. Run the Pi bridge at startup
+## 5. Run the Pi bridge at startup
 
 The supplied service file is `pi_client/fingerprint_bridge.service`.
 
@@ -203,7 +231,7 @@ sudo journalctl -u fingerprint_bridge.service -f
 
 The simpler `fingerprint_client.service` is for sending a fixed test resident ID and does not read the AS608 sensor.
 
-## 5. API and frontend integration
+## 6. API and frontend integration
 
 The full API contract is in [`API_DOCUMENTATION.md`](API_DOCUMENTATION.md). Important endpoints include:
 
@@ -223,13 +251,13 @@ The full API contract is in [`API_DOCUMENTATION.md`](API_DOCUMENTATION.md). Impo
 
 A React frontend running on port `3000` or `5173` should use a development proxy or the backend must be configured with CORS. Do not place XAMPP credentials in React environment variables.
 
-For the new frontend build, call `GET /api/auth/csrf` before login or any
+For the new frontend build, call `GET /api/csrf-token` before login or any
 write. Keep the returned `csrfToken` in the `X-CSRFToken` header and send
 requests with credentials. Add the frontend origin, including its port, to
 `FRONTEND_ORIGINS`. A development proxy is preferred because it avoids
 cross-site browser-cookie restrictions.
 
-## 6. Environment variables
+## 7. Environment variables
 
 | Variable | Default/use |
 | --- | --- |
@@ -250,8 +278,10 @@ cross-site browser-cookie restrictions.
 | `GEMINI_API_KEY` | Optional key for the chatbot feature |
 | `GEMINI_MODEL` | Optional Gemini model name |
 | `FINGERPRINT_DEVICE_TOKEN` | Shared secret required by the Raspberry Pi fingerprint client |
+| `SEHCS_DEVICE_TOKEN` | Shared secret used by Pi fall alerts (same value on Flask and Pi) |
+| `FALL_STREAM_URL` | Browser URL for the Pi stream, e.g. `http://192.168.1.50:8080/stream.mjpg` |
 
-## 7. Troubleshooting
+## 8. Troubleshooting
 
 ### Flask cannot connect to XAMPP
 
@@ -268,6 +298,95 @@ cross-site browser-cookie restrictions.
 - Allow Python/port `5000` through Windows Firewall on a trusted private network.
 - Confirm both devices are on the same network.
 - From the Pi, check the Flask URL in a browser or with `curl`.
+
+### Run the YOLOv8-pose fall detector and camera stream on the Pi
+
+The detector is a separate process from Flask. It opens the Pi camera, computes
+YOLOv8-pose keypoint inference, serves an MJPEG stream with blue person boxes
+and pose points, and sends only a new or
+cooldown-expired `FALL` event to Flask. The browser stream is intentionally
+separate from alert ingestion; keep port 8080 restricted to the trusted LAN.
+
+On the Pi (Raspberry Pi OS Bookworm):
+
+```bash
+sudo apt update
+sudo apt install -y python3-opencv python3-picamera2 libatlas-base-dev
+/home/raspi/Desktop/SEHCS/bin/pip install requests flask numpy onnxruntime
+```
+
+Copy `yolov8n-pose.onnx`, `SEHCS_WEB/pi_client/pose_run.py`, and
+`SEHCS_WEB/pi_client/fall_detector.py` into the flat Pi directory. The ONNX
+model must be at `/home/raspi/Desktop/SEHCS/yolov8n-pose.onnx`.
+The pose decoder applies non-maximum suppression, so overlapping YOLO boxes
+for one person are counted as one person on the stream and dashboard.
+Add the fall settings to the existing Pi environment file
+`/home/raspi/Desktop/SEHCS/pi.env` (or the environment file already used by your
+services):
+
+```env
+SEHCS_DEVICE_TOKEN=the-same-long-random-value-as-Flask
+BACKEND_API_URL=http://<FLASK_SERVER_IP>:5000/api/fall-alerts
+POSE_MODEL_PATH=/home/raspi/Desktop/SEHCS/yolov8n-pose.onnx
+FALL_CAMERA=0
+FALL_CAMERA_BACKEND=picamera2
+FALL_CAPTURE_WIDTH=320
+FALL_CAPTURE_HEIGHT=240
+FALL_TARGET_FPS=10
+FALL_THRESHOLD=0.55
+FALL_CONFIRM_FRAMES=3
+FALL_CONFIRM_WINDOW=5
+FALL_ALERT_COOLDOWN_SECONDS=45
+FALL_PERSON_DETECTION=1
+FALL_STREAM_PORT=8080
+# Optional: add ?token=... to FALL_STREAM_URL when using FALL_STREAM_TOKEN.
+FALL_STREAM_TOKEN=
+```
+
+`FALL_TARGET_FPS` caps both pose inference and MJPEG output. If inference is
+slower than ten FPS, the actual rate will be lower but the Pi will not process
+frames faster than the configured limit.
+
+The detector combines bounding-box posture, torso orientation, and motion
+instead of relying on one rigid fall shape. `FALL_CONFIRM_FRAMES` of the last
+`FALL_CONFIRM_WINDOW` frames must indicate a fall before the Pi sends the JSON
+event to `/api/fall-alerts`. This temporal confirmation reduces one-frame false
+alarms while allowing sideways, partially occluded, and camera-facing falls.
+The payload includes both `detection_confidence` and `confidence`, plus the
+device, location, timestamp, and confirmation counts for the fall alert agent.
+
+Verify the camera without a desktop preview with `rpicam-hello --list-cameras`
+(use `libcamera-hello --list-cameras` on older Raspberry Pi OS), then run:
+
+```bash
+cd /home/raspi/Desktop/SEHCS
+set -a; . ./.env; set +a
+/home/raspi/Desktop/SEHCS/bin/python fall_detector.py
+```
+
+The stream is `http://<PI_IP>:8080/stream.mjpg`; status is
+`http://<PI_IP>:8080/status`. Set that stream URL as `FALL_STREAM_URL` on the
+Flask machine and restart Flask. Do not use `127.0.0.1` in either URL unless
+both processes run on the same computer.
+
+With `FALL_PERSON_DETECTION=1`, OpenCV's built-in HOG detector draws blue
+`Person` boxes on the stream. This is general person detection, not resident
+identity recognition. Disable it with `FALL_PERSON_DETECTION=0` if the Pi needs
+more FPS, or if your OpenCV build does not include `HOGDescriptor`. The pose
+detector will continue running with YOLO person boxes and keypoints. Resident
+recognition would require a separate face/person-ID model and a privacy/consent
+workflow; pose detections are not named residents.
+
+For boot startup, copy `fall-detector.service` to
+`/home/raspi/Desktop/SEHCS/fall-detector.service`, then install that file into
+systemd and enable it:
+
+```bash
+sudo cp /home/raspi/Desktop/SEHCS/fall-detector.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now fall-detector.service
+journalctl -u fall-detector.service -f
+```
 
 ### AS608 is not detected
 
@@ -289,7 +408,7 @@ cross-site browser-cookie restrictions.
 - Never commit `.env` or database passwords. Rotate any credentials that have been exposed.
 - Legacy identity-only login is disabled by default. Configure a real OAuth/OIDC verifier before enabling user login; `AUTH_ALLOW_LEGACY_IDENTITY=1` is only a temporary trusted-network development override.
 - Use a long random `FLASK_SECRET_KEY`, `SESSION_COOKIE_SECURE=1` behind HTTPS, and keep `SESSION_COOKIE_SAMESITE=Strict`.
-- Set separate long random values for `FINGERPRINT_DEVICE_TOKEN` and `FALL_ALERT_DEVICE_TOKEN`; send them in `X-Fingerprint-Token` and `X-Fall-Alert-Token` respectively.
+- Set a long random `SEHCS_DEVICE_TOKEN`; send it in `X-Fingerprint-Token` for fingerprint requests and `X-Fall-Alert-Token` for fall requests.
 - Restrict Windows Firewall port `5000` to the trusted LAN where possible and add a reverse proxy with HTTPS for deployment.
 - Keep `ENABLE_DEBUG_ROUTES=0` outside local development.
 - Fingerprint templates are sensitive biometric data; secure the database and restrict enrollment access.
