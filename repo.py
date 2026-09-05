@@ -130,29 +130,33 @@ def ensure_user_password_column():
 
 
 def ensure_fall_event_id_column():
-    """Add the fall-event idempotency key to older database installations."""
+    """Bring older fall-incident tables up to the current event schema."""
     connection = get_db_connection()
     if connection is None:
         return
     with connection.cursor() as cursor:
-        cursor.execute(
-            """SELECT COUNT(*) AS count FROM information_schema.COLUMNS
-               WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'fall_incidents'
-               AND COLUMN_NAME = 'evidencePath'"""
-        )
-        evidence_column = cursor.fetchone()
-        if evidence_column is not None and evidence_column["count"] == 0:
+        columns = {
+            "deviceId": "VARCHAR(100) NULL",
+            "location": "VARCHAR(255) NULL",
+            "detectionConfidence": "DECIMAL(5,4) NULL",
+            "evidencePath": "VARCHAR(500) NULL",
+            "eventId": "VARCHAR(128) NULL",
+        }
+        event_column_added = False
+        for column_name, definition in columns.items():
             cursor.execute(
-                "ALTER TABLE fall_incidents ADD COLUMN evidencePath VARCHAR(500) NULL"
+                """SELECT COUNT(*) AS count FROM information_schema.COLUMNS
+                   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'fall_incidents'
+                   AND COLUMN_NAME = %s""",
+                (column_name,),
             )
-        cursor.execute(
-            """SELECT COUNT(*) AS count FROM information_schema.COLUMNS
-               WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'fall_incidents'
-               AND COLUMN_NAME = 'eventId'"""
-        )
-        column_count = cursor.fetchone()
-        if column_count is not None and column_count["count"] == 0:
-            cursor.execute("ALTER TABLE fall_incidents ADD COLUMN eventId VARCHAR(128) NULL")
+            column_count = cursor.fetchone()
+            if column_count is not None and column_count["count"] == 0:
+                cursor.execute(
+                    f"ALTER TABLE fall_incidents ADD COLUMN {column_name} {definition}"
+                )
+                event_column_added = event_column_added or column_name == "eventId"
+        if event_column_added:
             cursor.execute(
                 "CREATE UNIQUE INDEX uq_fall_incidents_eventId ON fall_incidents (eventId)"
             )
@@ -173,7 +177,8 @@ def get_user_by_open_id(open_id):
             """
             SELECT id, openId, name, email, password_hash, role
             FROM users
-            WHERE openId = %s OR email = %s
+                WHERE LOWER(TRIM(openId)) = LOWER(TRIM(%s))
+                    OR LOWER(TRIM(email)) = LOWER(TRIM(%s))
             LIMIT 1
             """,
             (open_id.strip(), open_id.strip()),
@@ -364,22 +369,30 @@ def alerts(user_id=None):
 
 
 def list_notifications(user_id=None):
-        connection = get_db_connection()
-        if connection is None:
-            return jsonify({"error": "Database is not available."}), 503
+    connection = get_db_connection()
+    if connection is None:
+        return jsonify({"error": "Database is not available."}), 503
 
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT n.id, n.residentId, n.type, n.message, n.isSent, n.sentAt,
-                       n.isRead, n.readAt, r.name AS resident_name
-                FROM notifications n
-                INNER JOIN elderly_residents r ON r.id = n.residentId AND r.user_id = %s
-                ORDER BY n.id DESC
-                """
-                , (user_id,)
-            )
-            rows = cursor.fetchall()
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT n.id, n.residentId, n.type, n.message, n.isSent, n.sentAt,
+                   n.isRead, n.readAt, r.name AS resident_name
+            FROM notifications n
+            INNER JOIN elderly_residents r ON r.id = n.residentId AND r.user_id = %s
+            UNION ALL
+            SELECT -fi.id AS id, fi.residentId, 'fall_alert' AS type,
+                    'EMERGENCY ALERT: Fall detected' AS message,
+                   1 AS isSent, fi.detectedAt AS sentAt, 0 AS isRead,
+                   NULL AS readAt, COALESCE(r.name, 'Unknown resident') AS resident_name
+            FROM fall_incidents fi
+            LEFT JOIN elderly_residents r ON r.id = fi.residentId
+            WHERE fi.residentId IS NULL
+            ORDER BY sentAt DESC
+            """,
+            (user_id,),
+        )
+        rows = cursor.fetchall()
 
         notifications = []
         for row in rows:
@@ -1176,7 +1189,7 @@ def list_fall_incidents(user_id, is_admin=False):
     if connection is None:
         return jsonify({"error": "Database is not available."}), 503
     with connection.cursor() as cursor:
-        query = "SELECT fi.* FROM fall_incidents fi LEFT JOIN elderly_residents r ON r.id=fi.residentId WHERE %s=1 OR r.user_id=%s ORDER BY fi.detectedAt DESC"
+        query = "SELECT fi.* FROM fall_incidents fi LEFT JOIN elderly_residents r ON r.id=fi.residentId WHERE %s=1 OR r.user_id=%s OR fi.residentId IS NULL ORDER BY fi.detectedAt DESC"
         cursor.execute(query, (int(is_admin), user_id))
         rows = cursor.fetchall()
     return jsonify({"fall_incidents": rows})

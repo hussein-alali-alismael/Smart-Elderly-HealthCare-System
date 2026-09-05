@@ -83,8 +83,6 @@ function AuthPage({ mode }) {
       <div className="auth-art">
         <div>
           <Brand />
-
-          <div className="eyebrow">منصة متكاملة</div>
           <h1>مراقبة ذكية <em>لرعاية أفضل</em></h1>
           <p>
             متابعة المسنين، تنظيم الأدوية، مراقبة المواعيد، وتتبع حالة كل مسن في منصة واحدة متكاملة.
@@ -174,6 +172,8 @@ function DashboardLayout() {
 
   useEffect(() => {
     loadAll();
+    const timer = window.setInterval(loadAll, 10000);
+    return () => window.clearInterval(timer);
   }, []);
 
   async function handleLogout() {

@@ -1,6 +1,18 @@
 Pi client for sending fingerprint payloads to the Flask server
 
-Place the `fingerprint_client.py` script on the Raspberry Pi under `/home/pi/SEHCS_WEB/pi_client`.
+Place the Pi client files under `/home/raspi/Desktop/SEHCS/pi_client`.
+
+Create one shared environment file for all Pi services:
+
+```bash
+cd ~/Desktop/SEHCS
+cp pi_client/pi.env.example .env
+nano .env
+```
+
+Set `SEHCS_DEVICE_TOKEN` to exactly the same value as the Windows Flask
+`.env`. Do not leave the `replace-with-...` placeholder. The fall detector and
+voice service both load `/home/raspi/Desktop/SEHCS/.env` through systemd.
 
 Install runtime requirements (on the Pi):
 

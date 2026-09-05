@@ -155,6 +155,20 @@ Open these URLs or call them from a browser/API client:
 
 If a database endpoint returns `503`, check that XAMPP MySQL is running and that `DB_PASSWORD` matches the XAMPP account.
 
+### Test the fall-alert speaker once
+
+This checks the Raspberry Pi voice service and sends one message without
+creating a fall incident or notification:
+
+```powershell
+python voice_smoke_test.py --message "SEHCS fall alert speaker test"
+```
+
+The Flask `.env` must contain `SEHCS_VOICE_DEVICE_URL` and either
+`SEHCS_VOICE_DEVICE_TOKEN` or the shared `SEHCS_DEVICE_TOKEN`. The Pi voice
+service must be running on port `5051` and its speaker/TTS setup must already
+pass the local `espeak-ng` test.
+
 ## 4. Connect Raspberry Pi to Flask
 
 The Pi communicates with Flask using HTTP JSON. Both devices must be on the same Wi-Fi/Ethernet network, or the Windows laptop must be reachable through a configured hotspot.
@@ -320,9 +334,9 @@ Copy `yolov8n-pose.onnx`, `SEHCS_WEB/pi_client/pose_run.py`, and
 model must be at `/home/raspi/Desktop/SEHCS/yolov8n-pose.onnx`.
 The pose decoder applies non-maximum suppression, so overlapping YOLO boxes
 for one person are counted as one person on the stream and dashboard.
-Add the fall settings to the existing Pi environment file
-`/home/raspi/Desktop/SEHCS/pi.env` (or the environment file already used by your
-services):
+Create one shared Pi environment file at
+`/home/raspi/Desktop/SEHCS/.env`. Use `pi_client/pi.env.example` as the template;
+the fall detector and voice service both load this same file:
 
 ```env
 SEHCS_DEVICE_TOKEN=the-same-long-random-value-as-Flask
@@ -333,10 +347,13 @@ FALL_CAMERA_BACKEND=picamera2
 FALL_CAPTURE_WIDTH=320
 FALL_CAPTURE_HEIGHT=240
 FALL_TARGET_FPS=10
-FALL_THRESHOLD=0.55
-FALL_CONFIRM_FRAMES=3
+FALL_THRESHOLD=0.50
+FALL_VELOCITY_SCALE=180
+FALL_CONFIRM_FRAMES=2
 FALL_CONFIRM_WINDOW=5
 FALL_ALERT_COOLDOWN_SECONDS=45
+FALL_ALERT_DEVICE_ID=main-camera
+FALL_ALERT_LOCATION=
 FALL_PERSON_DETECTION=1
 FALL_STREAM_PORT=8080
 # Optional: add ?token=... to FALL_STREAM_URL when using FALL_STREAM_TOKEN.
@@ -352,6 +369,8 @@ instead of relying on one rigid fall shape. `FALL_CONFIRM_FRAMES` of the last
 `FALL_CONFIRM_WINDOW` frames must indicate a fall before the Pi sends the JSON
 event to `/api/fall-alerts`. This temporal confirmation reduces one-frame false
 alarms while allowing sideways, partially occluded, and camera-facing falls.
+`FALL_VELOCITY_SCALE` controls falling sensitivity: lower it when a real fall
+is being shown as `LYING`; `180` is the default for a 10 FPS, 320x240 stream.
 The payload includes both `detection_confidence` and `confidence`, plus the
 device, location, timestamp, and confirmation counts for the fall alert agent.
 

@@ -31,7 +31,13 @@ class PoseDetection:
 class YOLOPoseFallModel:
     """Run a YOLOv8-pose ONNX model and score posture/motion as a fall."""
 
-    def __init__(self, model_path: str, threshold: float = 0.55, providers: list[str] | None = None):
+    def __init__(
+        self,
+        model_path: str,
+        threshold: float = 0.50,
+        velocity_scale: float = 180.0,
+        providers: list[str] | None = None,
+    ):
         self.session = ort.InferenceSession(
             model_path,
             providers=providers or ["CPUExecutionProvider"],
@@ -39,6 +45,9 @@ class YOLOPoseFallModel:
         self.input_name = self.session.get_inputs()[0].name
         self.output_name = self.session.get_outputs()[0].name
         self.threshold = threshold
+        # Lower values make a downward movement contribute sooner. This is
+        # deliberately configurable because camera height and FPS affect px/s.
+        self.velocity_scale = max(float(velocity_scale), 1.0)
 
     @staticmethod
     def _sigmoid(value: np.ndarray | float) -> np.ndarray | float:
@@ -143,14 +152,14 @@ class YOLOPoseFallModel:
         horizontal_pose = min(max((aspect_ratio - 0.65) / 1.35, 0.0), 1.0)
         orientation_pose = min(max((torso_horizontal - 0.35) / 0.55, 0.0), 1.0)
         posture_score = max(horizontal_pose, orientation_pose)
-        rapid_downward_motion = min(max(velocity / 300.0, 0.0), 1.0)
+        rapid_downward_motion = min(max(velocity / self.velocity_scale, 0.0), 1.0)
         low_torso = min(max((aspect_ratio - 1.0) / 1.4, 0.0), 1.0)
         pose_quality = min(max(detection.pose_score, 0.0), 1.0)
         # Keep a usable score when one or two landmarks are weak. The model's
         # pose quality is still a factor, but it no longer suppresses every
         # partially occluded fall to zero.
         quality_factor = 0.65 + 0.35 * pose_quality
-        fall_confidence = min(1.0, (posture_score * 0.60 + rapid_downward_motion * 0.25 + low_torso * 0.15) * quality_factor)
+        fall_confidence = min(1.0, (posture_score * 0.50 + rapid_downward_motion * 0.35 + low_torso * 0.15) * quality_factor)
         is_fall = fall_confidence >= self.threshold
         status = "FALL" if is_fall else ("LYING" if posture_score >= 0.55 else "STANDING")
         return {

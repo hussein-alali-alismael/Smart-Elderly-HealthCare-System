@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import hashlib
 import json
+import logging
 import math
 import requests
 import threading
@@ -169,6 +170,7 @@ class FallDetectionPipeline:
             connection.commit()
             return True
         except Exception as exc:
+            logging.exception("Could not persist fall incident")
             if getattr(exc, "args", [None])[0] == 1062:
                 event.is_duplicate = True
                 connection.rollback()

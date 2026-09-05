@@ -5,13 +5,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=pi
-WorkingDirectory=/home/pi/SEHCS_WEB/pi_client
-EnvironmentFile=-/home/pi/SEHCS_WEB/pi_client/pi.env
+User=raspi
+WorkingDirectory=/home/raspi/Desktop/SEHCS
+EnvironmentFile=/home/raspi/Desktop/SEHCS/.env
 # Use the Python interpreter from the Desktop venv created as ~/Desktop/SEHCS
 # Edit the --server and --device arguments as needed for your environment.
 # Default device set to /dev/serial0 (friendly UART alias on Raspberry Pi)
-ExecStart=/home/pi/Desktop/SEHCS/bin/python /home/pi/SEHCS_WEB/pi_client/fingerprint_sensor_bridge.py --server http://<FLASK_SERVER_IP>:5000 --device /dev/serial0 --poll 2.0
+ExecStart=/home/raspi/Desktop/SEHCS/bin/python /home/raspi/Desktop/SEHCS/pi_client/fingerprint_sensor_bridge.py --server ${FLASK_SERVER_URL} --device ${FINGERPRINT_DEVICE} --baudrate ${FINGERPRINT_BAUDRATE} --poll ${FINGERPRINT_POLL_SECONDS} --retries ${FINGERPRINT_RETRIES}
 Restart=on-failure
 RestartSec=10
 

@@ -10,6 +10,7 @@ import os
 import sys
 import threading
 import time
+import traceback
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,13 +29,14 @@ state = {
     "fall": False,
     "last_frame_at": None,
     "last_alert_at": None,
+    "last_alert_status": None,
     "last_error": None,
     "people": 0,
 }
 state_lock = threading.Lock()
 TARGET_FPS = max(1.0, float(os.getenv("FALL_TARGET_FPS", "10")))
 FRAME_INTERVAL = 1.0 / TARGET_FPS
-FALL_CONFIRM_FRAMES = max(1, int(os.getenv("FALL_CONFIRM_FRAMES", "3")))
+FALL_CONFIRM_FRAMES = max(1, int(os.getenv("FALL_CONFIRM_FRAMES", "2")))
 FALL_CONFIRM_WINDOW = max(FALL_CONFIRM_FRAMES, int(os.getenv("FALL_CONFIRM_WINDOW", "5")))
 
 
@@ -89,10 +91,13 @@ def _send_alert(session: requests.Session, backend_url: str, token: str, payload
         response.raise_for_status()
         with state_lock:
             state["last_alert_at"] = payload["detected_at"]
+            state["last_alert_status"] = response.status_code
             state["last_error"] = None
+        print(f"Fall alert delivered: HTTP {response.status_code} confidence={payload.get('detection_confidence')}", flush=True)
     except requests.RequestException as exc:
         with state_lock:
             state["last_error"] = f"alert delivery failed: {exc}"
+            state["last_alert_status"] = getattr(getattr(exc, "response", None), "status_code", None)
         print(state["last_error"], file=sys.stderr)
 
 
@@ -138,7 +143,8 @@ def run_detector(model_path: str, camera: int, backend_url: str, token: str, thr
         model_file = next((candidate for candidate in candidates if candidate.is_file()), model_file)
     if not model_file.is_file():
         raise FileNotFoundError(f"Fall model not found: {model_path}")
-    model = YOLOPoseFallModel(str(model_file), threshold=threshold)
+    velocity_scale = float(os.getenv("FALL_VELOCITY_SCALE", "180"))
+    model = YOLOPoseFallModel(str(model_file), threshold=threshold, velocity_scale=velocity_scale)
     previous_fall = False
     fall_history = deque(maxlen=FALL_CONFIRM_WINDOW)
     previous_center_y = None
@@ -149,6 +155,7 @@ def run_detector(model_path: str, camera: int, backend_url: str, token: str, thr
     location = os.getenv("FALL_ALERT_LOCATION", "") or None
     resident_id = os.getenv("FALL_ALERT_DEFAULT_RESIDENT_ID", "") or None
     frame_number = 0
+    consecutive_frame_failures = 0
     started = time.monotonic()
     next_frame_at = time.monotonic()
 
@@ -166,10 +173,16 @@ def run_detector(model_path: str, camera: int, backend_url: str, token: str, thr
             else:
                 ok, frame = capture.read()
             if not ok or frame is None:
+                consecutive_frame_failures += 1
                 with state_lock:
-                    state["last_error"] = "camera frame unavailable"
+                    state["last_error"] = (
+                        f"camera frame unavailable ({consecutive_frame_failures} consecutive failures)"
+                    )
+                if consecutive_frame_failures >= 20:
+                    raise RuntimeError(state["last_error"])
                 time.sleep(0.25)
                 continue
+            consecutive_frame_failures = 0
             frame_number += 1
             now = time.monotonic()
             result = model.predict(frame, previous_center_y, previous_pose_time, now)
@@ -220,20 +233,32 @@ def run_detector(model_path: str, camera: int, backend_url: str, token: str, thr
             picamera.stop()
 
 
+def _run_detector_worker(args) -> None:
+    """Run inference and terminate so systemd can restart on fatal errors."""
+    try:
+        run_detector(args.model, args.camera, args.backend, args.token, args.threshold, args.cooldown)
+    except BaseException as exc:
+        with state_lock:
+            state["last_error"] = f"detector stopped: {exc}"
+        print(f"FATAL: fall detector stopped: {exc}", file=sys.stderr, flush=True)
+        traceback.print_exc()
+        os._exit(1)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the Pi fall detector and MJPEG stream")
     parser.add_argument("--model", default=os.getenv("POSE_MODEL_PATH", os.getenv("FALL_MODEL_PATH", "yolov8n-pose.onnx")))
     parser.add_argument("--camera", type=int, default=int(os.getenv("FALL_CAMERA", "0")))
     parser.add_argument("--backend", default=os.getenv("BACKEND_API_URL", "http://127.0.0.1:5000/api/fall-alerts"))
     parser.add_argument("--token", default=os.getenv("SEHCS_DEVICE_TOKEN", ""))
-    parser.add_argument("--threshold", type=float, default=float(os.getenv("FALL_THRESHOLD", "0.55")))
+    parser.add_argument("--threshold", type=float, default=float(os.getenv("FALL_THRESHOLD", "0.50")))
     parser.add_argument("--cooldown", type=float, default=float(os.getenv("FALL_ALERT_COOLDOWN_SECONDS", "45")))
     parser.add_argument("--host", default=os.getenv("FALL_STREAM_HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.getenv("FALL_STREAM_PORT", "8080")))
     args = parser.parse_args()
     if not args.token:
         parser.error("--token or SEHCS_DEVICE_TOKEN is required")
-    worker = threading.Thread(target=run_detector, args=(args.model, args.camera, args.backend, args.token, args.threshold, args.cooldown), daemon=True)
+    worker = threading.Thread(target=_run_detector_worker, args=(args,), daemon=True)
     worker.start()
     app.run(host=args.host, port=args.port, threaded=True, use_reloader=False)
 

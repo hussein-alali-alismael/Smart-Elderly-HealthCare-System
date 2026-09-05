@@ -12,6 +12,11 @@ import requests
 logger = logging.getLogger(__name__)
 
 
+def _voice_device_token() -> str:
+    """Return the dedicated voice token, falling back to the device token."""
+    return os.getenv("SEHCS_VOICE_DEVICE_TOKEN", "").strip() or os.getenv("SEHCS_DEVICE_TOKEN", "").strip()
+
+
 def voice_enabled(default: bool = False) -> bool:
     value = os.getenv("SEHCS_VOICE_ENABLED")
     if value is None:
@@ -39,7 +44,7 @@ def speak(text: str, *, enabled: Optional[bool] = None) -> bool:
             response = requests.post(
                 device_url.rstrip("/") + "/speak",
                 json={"message": message},
-                headers={"X-Voice-Token": os.getenv("SEHCS_DEVICE_TOKEN", "")},
+                headers={"X-Voice-Token": _voice_device_token()},
                 timeout=3,
             )
             if response.status_code != 202:
@@ -48,10 +53,13 @@ def speak(text: str, *, enabled: Optional[bool] = None) -> bool:
                     response.status_code,
                     response.text[:200],
                 )
-            return response.status_code == 202
+            elif response.status_code == 202:
+                return True
         except requests.RequestException as exc:
             logger.warning("Could not reach Raspberry Pi voice service at %s: %s", device_url, exc)
-            return False
+        # Continue to the local platform speaker as a safety fallback. This
+        # keeps a fall announcement audible if the Pi voice service is down
+        # or its token/configuration is temporarily wrong.
 
     system = platform.system()
     try:
